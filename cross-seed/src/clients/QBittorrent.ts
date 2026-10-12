@@ -26,6 +26,7 @@ import {
 	SearcheeClient,
 	SearcheeWithInfoHash,
 	updateSearcheeClientDB,
+	upsertSearcheeClientDB,
 } from "../searchee.js";
 import {
 	errorMessage,
@@ -190,6 +191,11 @@ export default class QBittorrent implements TorrentClient {
 	readonly clientType = Label.QBITTORRENT;
 	readonly readonly: boolean;
 	readonly label: string;
+	private readonly refreshes = new Map<
+		string,
+		Promise<SearcheeClient | undefined>
+	>();
+	private aliasCatalog?: Promise<TorrentInfo[]>;
 
 	constructor(
 		url: string,
@@ -297,6 +303,7 @@ export default class QBittorrent implements TorrentClient {
 		body: BodyInit,
 		headers: Record<string, string> = {},
 		numRetries = 3,
+		requireSuccess = false,
 	): Promise<string | undefined> {
 		const bodyStr =
 			body instanceof URLSearchParams || body instanceof FormData
@@ -377,6 +384,11 @@ export default class QBittorrent implements TorrentClient {
 				await wait(Math.min(ms("1 second") * 2 ** i, ms("10 seconds")));
 				continue;
 			}
+		}
+		if (requireSuccess && !response?.ok) {
+			throw new CrossSeedError(
+				`[${this.label}] Metadata request failed (${response?.status ?? "transport error"})`,
+			);
 		}
 		return response?.text();
 	}
@@ -747,6 +759,100 @@ export default class QBittorrent implements TorrentClient {
 					? [torrent.tracker]
 					: undefined,
 		}));
+	}
+
+	/** Refresh only the requested source; absence never prunes unrelated cache rows. */
+	refreshOne(inputHash: string): Promise<SearcheeClient | undefined> {
+		const hash = inputHash.toLowerCase();
+		const existing = this.refreshes.get(hash);
+		if (existing) return existing;
+		const pending = this.refreshOneUncached(hash).finally(() =>
+			this.refreshes.delete(hash),
+		);
+		this.refreshes.set(hash, pending);
+		return pending;
+	}
+
+	private async metadataRequest<T>(
+		route: string,
+		params: URLSearchParams,
+	): Promise<T> {
+		const text = await this.request(route, params, {}, 3, true);
+		if (!text)
+			throw new CrossSeedError(`[${this.label}] Empty metadata response`);
+		const value: unknown = JSON.parse(text);
+		if (!Array.isArray(value))
+			throw new CrossSeedError(
+				`[${this.label}] Invalid metadata response`,
+			);
+		return value as T;
+	}
+
+	private async refreshOneUncached(
+		hash: string,
+	): Promise<SearcheeClient | undefined> {
+		const matches = (torrent: TorrentInfo) =>
+			[torrent.hash, torrent.infohash_v1, torrent.infohash_v2].some(
+				(alias) => alias?.toLowerCase() === hash,
+			);
+		const targeted = await this.metadataRequest<TorrentInfo[]>(
+			"/torrents/info",
+			new URLSearchParams({
+				hashes: hash,
+				includeFiles: "true",
+				includeTrackers: "true",
+			}),
+		);
+		let torrent = targeted.find(matches);
+		if (!torrent) {
+			// Older qB versions do not resolve v2 aliases in the hashes filter. Share
+			// at most one catalog request among concurrent misses; do not retain stale
+			// negative results across subsequent refreshes.
+			this.aliasCatalog ??= this.metadataRequest<TorrentInfo[]>(
+				"/torrents/info",
+				new URLSearchParams(),
+			).finally(() => {
+				this.aliasCatalog = undefined;
+			});
+			torrent = (await this.aliasCatalog).find(matches);
+		}
+		if (!torrent) return undefined;
+		const files = (
+			torrent.files ??
+			(await this.metadataRequest<TorrentFile[]>(
+				"/torrents/files",
+				new URLSearchParams({ hash: torrent.hash }),
+			))
+		).map((f) => this.torrentFileToFile(f));
+		if (!files.length)
+			throw new CrossSeedError(
+				`[${this.label}] No source files found during metadata refresh`,
+			);
+		const trackers = organizeTrackers(
+			torrent.trackers ??
+				(await this.metadataRequest<TorrentTracker[]>(
+					"/torrents/trackers",
+					new URLSearchParams({ hash: torrent.hash }),
+				)),
+		);
+		const name = torrent.name;
+		const searchee: SearcheeClient = {
+			infoHash: (torrent.infohash_v1 || torrent.hash).toLowerCase(),
+			name,
+			title: parseTitle(name, files) ?? name,
+			files,
+			length: torrent.total_size,
+			clientHost: this.clientHost,
+			savePath: torrent.save_path,
+			category: torrent.category,
+			tags: torrent.tags
+				.split(",")
+				.map((tag) => tag.trim())
+				.filter(Boolean),
+			trackers,
+		};
+		await upsertSearcheeClientDB([searchee]);
+		return searchee;
 	}
 
 	/**

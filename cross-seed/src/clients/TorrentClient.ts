@@ -91,6 +91,8 @@ export interface TorrentClient {
 		includeFiles?: boolean;
 		includeTrackers?: boolean;
 	}) => Promise<ClientSearcheeResult>;
+	/** Refresh a single source without reconciling an incomplete snapshot. */
+	refreshOne?: (infoHash: string) => Promise<SearcheeClient | undefined>;
 	getDownloadDir: (
 		meta: SearcheeWithInfoHash | Metafile,
 		options: { onlyCompleted: boolean },
@@ -229,6 +231,19 @@ export function clientSearcheeModified(
 		return true;
 	}
 	return false;
+}
+
+/** Preserve existing full-refresh behavior for adapters without scoped support. */
+export async function refreshClientSearchee(
+	client: TorrentClient,
+	infoHash: string,
+): Promise<SearcheeClient | undefined> {
+	if (client.refreshOne) return client.refreshOne(infoHash);
+	const result = await client.getClientSearchees({
+		newSearcheesOnly: true,
+		refresh: [infoHash],
+	});
+	return result.newSearchees.find((s) => s.infoHash === infoHash);
 }
 
 export function organizeTrackers(trackers: Tracker[]): string[] {
