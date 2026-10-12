@@ -1,3 +1,4 @@
+import { writeEnsembleTorrentEntries } from "./ensembleWriter.js";
 import { distance } from "fastest-levenshtein";
 import bencode from "bencode";
 import { readdir, readFile, stat } from "fs/promises";
@@ -551,17 +552,9 @@ async function indexTorrents(options: { startup: boolean }): Promise<void> {
 	}
 	if (!seasonFromEpisodes) return;
 
-	const ensembleRows = await flatMapAsync(
-		searchees,
-		async (searchee) =>
-			(await cacheEnsembleTorrentEntry(searchee, infoHashPathMap)) ?? [],
+	await writeEnsembleTorrentEntries(searchees, (source) =>
+		cacheEnsembleTorrentEntry(source, infoHashPathMap),
 	);
-	await inBatches(ensembleRows, async (batch) => {
-		await db("ensemble")
-			.insert(batch)
-			.onConflict(["client_host", "path"])
-			.merge();
-	});
 }
 
 async function indexTorrentDir(dir: string): Promise<SearcheeWithInfoHash[]> {
