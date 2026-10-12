@@ -402,6 +402,13 @@ export async function updateSearcheeClientDB(
 			.where("client_host", clientHost)
 			.del();
 	});
+	await upsertSearcheeClientDB(newSearchees);
+}
+
+/** Update scoped metadata without reconciling a complete client snapshot. */
+export async function upsertSearcheeClientDB(
+	newSearchees: SearcheeClient[],
+): Promise<void> {
 	await inBatches(
 		newSearchees.map((searchee) => ({
 			info_hash: searchee.infoHash,

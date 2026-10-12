@@ -15,6 +15,7 @@ import {
 import { dirname, join, resolve } from "path";
 import {
 	getClients,
+	refreshClientSearchee,
 	shouldRecheck,
 	TorrentClient,
 } from "./clients/TorrentClient.js";
@@ -254,12 +255,10 @@ async function getSavePath(
 	if (searchee.savePath) {
 		if (searchee.label !== Label.INJECT) {
 			// This check is too slow for the number of searchees from the inject job
-			const refreshedSearchee = (
-				await client.getClientSearchees({
-					newSearcheesOnly: true,
-					refresh: [searchee.infoHash],
-				})
-			).newSearchees.find((s) => s.infoHash === searchee.infoHash);
+			const refreshedSearchee = await refreshClientSearchee(
+				client,
+				searchee.infoHash,
+			);
 			if (!refreshedSearchee) return resultOfErr("TORRENT_NOT_FOUND");
 			Object.assign(searchee, refreshedSearchee);
 		}
