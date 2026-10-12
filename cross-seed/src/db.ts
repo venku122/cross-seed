@@ -12,6 +12,7 @@ import { TORRENT_CACHE_FOLDER } from "./constants.js";
 import { getCachedTorrentName, rebuildGuidInfoHashMap } from "./decide.js";
 import { Label, logger } from "./logger.js";
 import { getRuntimeConfig } from "./runtimeConfig.js";
+import { writeEnsembleTorrentEntries } from "./ensembleWriter.js";
 import { migrations } from "./migrations/migrations.js";
 import { Metafile } from "./parseTorrent.js";
 import {
@@ -276,17 +277,7 @@ export async function cleanupDB(): Promise<void> {
 			label: Label.CLEANUP,
 			message: "Refreshing all ensemble torrents...",
 		});
-		const ensembleRows = await flatMapAsync(
-			searchees,
-			async (searchee) =>
-				(await cacheEnsembleTorrentEntry(searchee)) ?? [],
-		);
-		await inBatches(ensembleRows, async (batch) => {
-			await db("ensemble")
-				.insert(batch)
-				.onConflict(["client_host", "path"])
-				.merge();
-		});
+		await writeEnsembleTorrentEntries(searchees, cacheEnsembleTorrentEntry);
 	})();
 	if (dataDirs.length || seasonFromEpisodes) {
 		logger.verbose({
