@@ -4,10 +4,13 @@ import { omitUndefined } from "./utils/object.js";
 import type { RuntimeConfig } from "@cross-seed/shared/configSchema";
 export type { RuntimeConfig };
 
+import { invalidateHealth } from "./healthGeneration.js";
+
 let runtimeConfig: RuntimeConfig;
 
 export function setRuntimeConfig(configObj: RuntimeConfig): void {
 	runtimeConfig = configObj;
+	invalidateHealth();
 }
 
 export function getRuntimeConfig(
