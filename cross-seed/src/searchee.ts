@@ -402,8 +402,8 @@ export async function updateSearcheeClientDB(
 			.where("client_host", clientHost)
 			.del();
 	});
-	await inBatches(
-		newSearchees.map((searchee) => ({
+	await inBatches(newSearchees, async (batch) => {
+		const rows = batch.map((searchee) => ({
 			info_hash: searchee.infoHash,
 			name: searchee.name,
 			title: searchee.title,
@@ -414,14 +414,12 @@ export async function updateSearcheeClientDB(
 			category: searchee.category ?? null,
 			tags: searchee.tags ? JSON.stringify(searchee.tags) : null,
 			trackers: JSON.stringify(searchee.trackers),
-		})),
-		async (batch) => {
-			await db("client_searchee")
-				.insert(batch)
-				.onConflict(["client_host", "info_hash"])
-				.merge();
-		},
-	);
+		}));
+		await db("client_searchee")
+			.insert(rows)
+			.onConflict(["client_host", "info_hash"])
+			.merge();
+	});
 }
 
 export interface ClientSearcheeRow {

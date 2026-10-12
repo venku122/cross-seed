@@ -1,3 +1,4 @@
+import { cachedClientTorrents } from "./clientCache.js";
 import { type Stats } from "fs";
 import { readdir, stat } from "fs/promises";
 import { basename, dirname, join, resolve, sep } from "path";
@@ -10,14 +11,12 @@ import {
 	TORRENT_TAG,
 	USER_AGENT,
 } from "../constants.js";
-import { db } from "../db.js";
 import { CrossSeedError } from "../errors.js";
 import { Label, logger } from "../logger.js";
 import { Metafile } from "../parseTorrent.js";
 import { Result, resultOf, resultOfErr } from "../Result.js";
 import { getRuntimeConfig } from "../runtimeConfig.js";
 import {
-	ClientSearcheeRow,
 	createSearcheeFromDB,
 	File,
 	parseTitle,
@@ -693,13 +692,56 @@ export default class RTorrent implements TorrentClient {
 			return { searchees, newSearchees };
 		}
 		const infoHashes = new Set<string>();
-		for (let i = 0; i < hashes.length; i++) {
-			const infoHash = hashes[i].toLowerCase();
+		for await (const {
+			index: i,
+			infoHash,
+			useCache,
+			dbTorrent,
+		} of cachedClientTorrents(
+			hashes,
+			this.clientHost,
+			(hash) => hash.toLowerCase(),
+			(_hash, dbTorrent, infoHash, i) => {
+				const name = results[i * numMethods][0] as string;
+				const directory = results[i * numMethods + 2][0] as string;
+				const isMultiFile = Boolean(
+					Number(results[i * numMethods + 3][0] as string),
+				);
+				const labels = results[i * numMethods + 4][0] as string;
+				const savePath = isMultiFile ? dirname(directory) : directory;
+				const tags = labels.length
+					? decodeURIComponent(labels)
+							.split(",")
+							.map((tag) => tag.trim())
+					: [];
+				const modified = clientSearcheeModified(
+					this.label,
+					dbTorrent,
+					name,
+					savePath,
+					{
+						tags,
+					},
+				);
+				const refresh =
+					options?.refresh === undefined
+						? false
+						: options.refresh.length === 0
+							? true
+							: options.refresh.includes(infoHash);
+
+				return !modified && !refresh;
+			},
+			!options?.newSearcheesOnly && options?.refresh?.length !== 0,
+		)) {
 			infoHashes.add(infoHash);
-			const dbTorrent = await db<ClientSearcheeRow>("client_searchee")
-				.where("info_hash", infoHash)
-				.where("client_host", this.clientHost)
-				.first();
+			if (useCache) {
+				if (!options?.newSearcheesOnly) {
+					searchees.push(createSearcheeFromDB(dbTorrent!));
+				}
+				continue;
+			}
+
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			const r: any[][] = results;
 			const name: string = r[i * numMethods][0] as string;
@@ -714,27 +756,6 @@ export default class RTorrent implements TorrentClient {
 						.split(",")
 						.map((tag) => tag.trim())
 				: [];
-			const modified = clientSearcheeModified(
-				this.label,
-				dbTorrent,
-				name,
-				savePath,
-				{
-					tags,
-				},
-			);
-			const refresh =
-				options?.refresh === undefined
-					? false
-					: options.refresh.length === 0
-						? true
-						: options.refresh.includes(infoHash);
-			if (!modified && !refresh) {
-				if (!options?.newSearcheesOnly) {
-					searchees.push(createSearcheeFromDB(dbTorrent!));
-				}
-				continue;
-			}
 			const length = Number(r[i * numMethods + 1][0] as string);
 			const files: File[] = (
 				r[i * numMethods + 5][0] as [string, string][]
