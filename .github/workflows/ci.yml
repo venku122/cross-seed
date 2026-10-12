@@ -80,7 +80,7 @@ jobs:
                   cross-seed --version
 
     docker-meta:
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ github.repository == 'cross-seed/cross-seed' && github.event_name != 'pull_request' }}
         runs-on: ubuntu-latest
         outputs:
             tags: ${{ steps.meta.outputs.tags }}
@@ -103,7 +103,7 @@ jobs:
                       type=raw,value=prerelease,enable=${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
 
     docker-build:
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ github.repository == 'cross-seed/cross-seed' && github.event_name != 'pull_request' }}
         needs: docker-meta
         environment: Docker Hub
         strategy:
@@ -210,7 +210,7 @@ jobs:
                   done <<< "$TAGS"
 
     docker-manifest:
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ github.repository == 'cross-seed/cross-seed' && github.event_name != 'pull_request' }}
         needs:
             - docker-meta
             - docker-build
