@@ -1,3 +1,4 @@
+import { cachedClientTorrents } from "./clientCache.js";
 import { readdir } from "fs/promises";
 import ms from "ms";
 import path from "path";
@@ -11,14 +12,12 @@ import {
 	TORRENT_TAG,
 	USER_AGENT,
 } from "../constants.js";
-import { db } from "../db.js";
 import { CrossSeedError } from "../errors.js";
 import { Label, logger } from "../logger.js";
 import { Metafile } from "../parseTorrent.js";
 import { Result, resultOf, resultOfErr } from "../Result.js";
 import { getRuntimeConfig } from "../runtimeConfig.js";
 import {
-	ClientSearcheeRow,
 	createSearcheeFromDB,
 	File,
 	parseTitle,
@@ -261,6 +260,8 @@ export default class QBittorrent implements TorrentClient {
 			X_WWW_FORM_URLENCODED,
 			healthOnly ? 1 : 3,
 			healthOnly,
+			// A health handshake cannot rejoin its own shared login promise.
+			!healthOnly,
 		);
 		if (!version) {
 			throw new CrossSeedError(
@@ -342,6 +343,7 @@ export default class QBittorrent implements TorrentClient {
 		headers: Record<string, string> = {},
 		numRetries = 3,
 		requireSuccess = false,
+		allowReauth = true,
 	): Promise<string | undefined> {
 		const bodyStr =
 			body instanceof URLSearchParams || body instanceof FormData
@@ -372,7 +374,7 @@ export default class QBittorrent implements TorrentClient {
 					signal: AbortSignal.timeout(ms("10 minutes")),
 				});
 				if (response.status === 403) {
-					if (i >= retries) {
+					if (!allowReauth || i >= retries) {
 						logger.error({
 							label: this.label,
 							message: `Received 403 from API after ${retries} retries`,
@@ -427,7 +429,7 @@ export default class QBittorrent implements TorrentClient {
 		}
 		if (requireSuccess && !response?.ok) {
 			throw new CrossSeedError(
-				`[${this.label}] Metadata or health request failed (${response?.status ?? "transport error"})`,
+				`[${this.label}] Metadata or health request failed with code ${response?.status ?? "transport error"}`,
 			);
 		}
 		return response?.text();
@@ -958,15 +960,54 @@ export default class QBittorrent implements TorrentClient {
 			});
 			return { searchees, newSearchees };
 		}
-		for (const torrent of torrents) {
-			const infoHash = (
-				torrent.infohash_v1 || torrent.hash
-			).toLowerCase();
+		for await (const {
+			torrent,
+			infoHash,
+			useCache,
+			dbTorrent,
+		} of cachedClientTorrents(
+			torrents,
+			this.clientHost,
+			(torrent) => (torrent.infohash_v1 || torrent.hash).toLowerCase(),
+			(torrent, dbTorrent, infoHash) => {
+				const { name } = torrent;
+				const savePath = torrent.save_path;
+				const category = torrent.category;
+				const tags = torrent.tags.length
+					? torrent.tags
+							.split(",")
+							.map((tag) => tag.trim())
+							.filter((tag) => tag.length)
+					: [];
+				const modified = clientSearcheeModified(
+					this.label,
+					dbTorrent,
+					name,
+					savePath,
+					{
+						category,
+						tags,
+					},
+				);
+				const refresh =
+					options?.refresh === undefined
+						? false
+						: options.refresh.length === 0
+							? true
+							: options.refresh.includes(infoHash);
+
+				return !modified && !refresh;
+			},
+			!options?.newSearcheesOnly && options?.refresh?.length !== 0,
+		)) {
 			infoHashes.add(infoHash);
-			const dbTorrent = await db<ClientSearcheeRow>("client_searchee")
-				.where("info_hash", infoHash)
-				.where("client_host", this.clientHost)
-				.first();
+			if (useCache) {
+				if (!options?.newSearcheesOnly) {
+					searchees.push(createSearcheeFromDB(dbTorrent!));
+				}
+				continue;
+			}
+
 			const { name } = torrent;
 			const savePath = torrent.save_path;
 			const category = torrent.category;
@@ -976,28 +1017,6 @@ export default class QBittorrent implements TorrentClient {
 						.map((tag) => tag.trim())
 						.filter((tag) => tag.length)
 				: [];
-			const modified = clientSearcheeModified(
-				this.label,
-				dbTorrent,
-				name,
-				savePath,
-				{
-					category,
-					tags,
-				},
-			);
-			const refresh =
-				options?.refresh === undefined
-					? false
-					: options.refresh.length === 0
-						? true
-						: options.refresh.includes(infoHash);
-			if (!modified && !refresh) {
-				if (!options?.newSearcheesOnly) {
-					searchees.push(createSearcheeFromDB(dbTorrent!));
-				}
-				continue;
-			}
 			const files =
 				torrent.files?.map((f) => this.torrentFileToFile(f)) ??
 				(await this.getFiles(torrent.hash));

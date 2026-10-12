@@ -404,14 +404,15 @@ export async function updateSearcheeClientDB(
 			.del();
 	});
 	await upsertSearcheeClientDB(newSearchees);
+	if (removedInfoHashes.length) invalidateHealth();
 }
 
 /** Update scoped metadata without reconciling a complete client snapshot. */
 export async function upsertSearcheeClientDB(
 	newSearchees: SearcheeClient[],
 ): Promise<void> {
-	await inBatches(
-		newSearchees.map((searchee) => ({
+	await inBatches(newSearchees, async (batch) => {
+		const rows = batch.map((searchee) => ({
 			info_hash: searchee.infoHash,
 			name: searchee.name,
 			title: searchee.title,
@@ -422,15 +423,13 @@ export async function upsertSearcheeClientDB(
 			category: searchee.category ?? null,
 			tags: searchee.tags ? JSON.stringify(searchee.tags) : null,
 			trackers: JSON.stringify(searchee.trackers),
-		})),
-		async (batch) => {
-			await db("client_searchee")
-				.insert(batch)
-				.onConflict(["client_host", "info_hash"])
-				.merge();
-		},
-	);
-	if (newSearchees.length || removedInfoHashes.length) invalidateHealth();
+		}));
+		await db("client_searchee")
+			.insert(rows)
+			.onConflict(["client_host", "info_hash"])
+			.merge();
+	});
+	if (newSearchees.length) invalidateHealth();
 }
 
 export interface ClientSearcheeRow {

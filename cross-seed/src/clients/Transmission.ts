@@ -1,3 +1,4 @@
+import { cachedClientTorrents } from "./clientCache.js";
 import { readdir } from "fs/promises";
 import ms from "ms";
 import { basename } from "path";
@@ -9,14 +10,12 @@ import {
 	TORRENT_TAG,
 	USER_AGENT,
 } from "../constants.js";
-import { db } from "../db.js";
 import { CrossSeedError } from "../errors.js";
 import { Label, logger } from "../logger.js";
 import { Metafile } from "../parseTorrent.js";
 import { Result, resultOf, resultOfErr } from "../Result.js";
 import { getRuntimeConfig } from "../runtimeConfig.js";
 import {
-	ClientSearcheeRow,
 	createSearcheeFromDB,
 	parseTitle,
 	Searchee,
@@ -380,37 +379,50 @@ export default class Transmission implements TorrentClient {
 			});
 			return { searchees, newSearchees };
 		}
-		for (const torrent of torrents) {
-			const infoHash = torrent.hashString.toLowerCase();
+		for await (const {
+			torrent,
+			infoHash,
+			useCache,
+			dbTorrent,
+		} of cachedClientTorrents(
+			torrents,
+			this.clientHost,
+			(torrent) => torrent.hashString.toLowerCase(),
+			(torrent, dbTorrent, infoHash) => {
+				const { name } = torrent;
+				const savePath = torrent.downloadDir;
+				const tags = torrent.labels;
+				const modified = clientSearcheeModified(
+					this.label,
+					dbTorrent,
+					name,
+					savePath,
+					{
+						tags,
+					},
+				);
+				const refresh =
+					options?.refresh === undefined
+						? false
+						: options.refresh.length === 0
+							? true
+							: options.refresh.includes(infoHash);
+
+				return !modified && !refresh;
+			},
+			!options?.newSearcheesOnly && options?.refresh?.length !== 0,
+		)) {
 			infoHashes.add(infoHash);
-			const dbTorrent = await db<ClientSearcheeRow>("client_searchee")
-				.where("info_hash", infoHash)
-				.where("client_host", this.clientHost)
-				.first();
-			const { name } = torrent;
-			const savePath = torrent.downloadDir;
-			const tags = torrent.labels;
-			const modified = clientSearcheeModified(
-				this.label,
-				dbTorrent,
-				name,
-				savePath,
-				{
-					tags,
-				},
-			);
-			const refresh =
-				options?.refresh === undefined
-					? false
-					: options.refresh.length === 0
-						? true
-						: options.refresh.includes(infoHash);
-			if (!modified && !refresh) {
+			if (useCache) {
 				if (!options?.newSearcheesOnly) {
 					searchees.push(createSearcheeFromDB(dbTorrent!));
 				}
 				continue;
 			}
+
+			const { name } = torrent;
+			const savePath = torrent.downloadDir;
+			const tags = torrent.labels;
 			const files = torrent.files.map((file) => ({
 				name: basename(file.name),
 				path: file.name,

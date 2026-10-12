@@ -16,6 +16,8 @@ const { setClientsForTesting } =
 	await import("../src/clients/TorrentClient.js");
 const { createFakeTorrentClientServer, FakeTorrentClient } =
 	await import("./support/fakeTorrentClient.js");
+const { upsertSearcheeClientDB, updateSearcheeClientDB } =
+	await import("../src/searchee.js");
 const { Action } = await import("../src/constants.js");
 const { healthRouter } = await import("../src/trpc/routers/health.js");
 const fake = createFakeTorrentClientServer();
@@ -111,6 +113,49 @@ describe.sequential("health router snapshots", () => {
 		const before = validations;
 		await Promise.all(Array.from({ length: 10 }, () => caller.refresh()));
 		expect(validations).toBe(before + 1);
+	});
+	it("invalidates snapshots for scoped batched metadata writes and host-scoped pruning", async () => {
+		const other = {
+			infoHash: "f".repeat(40),
+			name: "Unrelated",
+			title: "Unrelated",
+			files: [{ name: "other.mkv", path: "other.mkv", length: 1 }],
+			length: 1,
+			clientHost: "other-host",
+			savePath: root,
+			trackers: [],
+		};
+		await upsertSearcheeClientDB([other]);
+		await caller.refresh();
+		const before = validations;
+		const sources = Array.from({ length: 101 }, (_, index) => ({
+			...other,
+			infoHash: index.toString(16).padStart(40, "0"),
+			clientHost: "updated-host",
+			name: `Updated ${index}`,
+			title: `Updated ${index}`,
+		}));
+		await upsertSearcheeClientDB(sources);
+		await caller.get();
+		expect(validations).toBe(before + 1);
+		expect(
+			await db("client_searchee").where("client_host", "updated-host"),
+		).toHaveLength(101);
+		expect(
+			await db("client_searchee").where("client_host", "other-host"),
+		).toHaveLength(1);
+		await updateSearcheeClientDB("updated-host", [], new Set());
+		await caller.get();
+		expect(validations).toBe(before + 2);
+		expect(
+			await db("client_searchee").where("client_host", "updated-host"),
+		).toHaveLength(0);
+		expect(
+			await db("client_searchee").where("client_host", "other-host"),
+		).toHaveLength(1);
+		await upsertSearcheeClientDB([]);
+		await caller.get();
+		expect(validations).toBe(before + 2);
 	});
 	it("surfaces client failure with stable identity and retries without waiting for successful TTL", async () => {
 		failure = true;

@@ -219,7 +219,9 @@ export function byClientHostPriority(clientHost: string | undefined): number {
 
 export function clientSearcheeModified(
 	label: string,
-	dbTorrent: ClientSearcheeRow | undefined,
+	dbTorrent:
+		| Pick<ClientSearcheeRow, "name" | "save_path" | "category" | "tags">
+		| undefined,
 	name: string,
 	savePath: string,
 	options: { category?: string; tags?: string[] } = {},

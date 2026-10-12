@@ -26,10 +26,12 @@ operation that is still running.
 qB health validation retains version and torrentDir checks, uses its existing
 session, only reauthenticates when needed, and skips tag creation. Deluge status
 reuses its session and can refresh expired authentication, but never deletes the
-session or reconnects a disconnected daemon. Explicit default validation retains
-its existing side effects; startup currently instantiates clients without
-calling full validation. Deluge authentication still reads its Label plugin
-capability so health does not disable later injection labeling. qB uses a
+session or reconnects a disconnected daemon. Health login handshakes reject a
+forbidden version response without recursively joining their own shared
+authentication promise; later refreshes can recover. Explicit default validation
+retains its existing side effects; startup currently instantiates clients
+without calling full validation. Deluge authentication still reads its Label
+plugin capability so health does not disable later injection labeling. qB uses a
 dedicated lightweight save-path catalog read instead of hydrating/reconciling
 client metadata; other adapters retain their existing cached/coalesced
 enumeration. Actual linking and writable-directory diagnostics still create
@@ -72,6 +74,11 @@ also use the conservative five-second failure TTL.
 
 ## Measured results
 
+These final 90 workers measured compiled production revision
+`5fb33f95436904060267316e0bb9b3d88b21bb08`, including the login-handshake
+recovery fix. The earlier pre-fix matrix remains archived separately. All
+registered provider source/dist hashes stayed unchanged before and after timing.
+
 All 90 fresh workers completed successfully in the exclusive timing slot on Node
 26.11.1 / SQLite 3.53.4. Each value below is the median across five workers; A1
 and A2 are pristine baseline runs surrounding candidate B. Every worker runs
@@ -80,21 +87,21 @@ requests spaced 60 seconds apart.
 
 | Scenario                          | Three-batch wall ms A1 / B / A2 | First-batch ms A1 / B / A2 |
 | --------------------------------- | ------------------------------- | -------------------------- |
-| 1 tab, links off                  | 50.65 / 16.85 / 49.51           | 18.72 / 16.76 / 18.35      |
-| 10 tabs, links off                | 425.42 / 17.85 / 431.77         | 146.85 / 17.47 / 148.31    |
-| 10 tabs, 8,194 torrents, 2 paths  | 9947.31 / 29.96 / 8716.81       | 3122.78 / 29.58 / 2976.66  |
-| 10 tabs, 1,000 torrents, 10 paths | 1630.44 / 27.30 / 1829.51       | 595.55 / 26.86 / 583.22    |
-| 10 tabs, slow client              | 1110.41 / 72.74 / 1107.86       | 368.62 / 72.29 / 389.84    |
-| 10 tabs, failed authentication    | 428.26 / 22.86 / 426.15         | 150.26 / 22.51 / 151.97    |
+| 1 tab, links off                  | 48.96 / 16.79 / 51.10           | 17.98 / 16.67 / 18.43      |
+| 10 tabs, links off                | 436.28 / 17.85 / 443.21         | 149.97 / 17.02 / 148.79    |
+| 10 tabs, 8,194 torrents, 2 paths  | 8484.86 / 27.92 / 8619.97       | 2865.97 / 27.57 / 2878.95  |
+| 10 tabs, 1,000 torrents, 10 paths | 1582.16 / 25.45 / 1584.71       | 567.68 / 25.08 / 577.10    |
+| 10 tabs, slow client              | 999.49 / 69.74 / 995.73         | 338.73 / 69.34 / 337.57    |
+| 10 tabs, failed authentication    | 401.96 / 21.95 / 408.52         | 144.20 / 21.56 / 146.04    |
 
-| Scenario                          | CPU ms A1 / B / A2        | Sampled peak RSS MiB A1 / B / A2 | Ping p99 ms A1 / B / A2  | Event-loop p99 ms A1 / B / A2 |
-| --------------------------------- | ------------------------- | -------------------------------- | ------------------------ | ----------------------------- |
-| 1 tab, links off                  | 57.35 / 18.57 / 56.29     | 144.78 / 144.14 / 144.95         | 14.02 / 4.23 / 14.32     | 13.46 / 14.71 / 15.20         |
-| 10 tabs, links off                | 461.24 / 19.99 / 462.10   | 156.34 / 143.64 / 155.95         | 132.21 / 13.81 / 134.50  | 127.86 / 13.98 / 132.25       |
-| 10 tabs, 8,194 torrents, 2 paths  | 9881.14 / 35.86 / 9207.30 | 387.03 / 201.14 / 444.67         | 2982.18 / 9.76 / 2876.82 | 1645.22 / 15.88 / 1626.34     |
-| 10 tabs, 1,000 torrents, 10 paths | 2010.55 / 34.22 / 2091.33 | 260.83 / 156.41 / 250.62         | 487.34 / 15.95 / 558.29  | 335.54 / 13.63 / 312.74       |
-| 10 tabs, slow client              | 890.62 / 46.66 / 891.36   | 204.45 / 144.20 / 203.64         | 154.51 / 15.77 / 145.53  | 45.94 / 13.20 / 40.99         |
-| 10 tabs, failed authentication    | 480.65 / 33.19 / 482.28   | 164.59 / 150.27 / 164.44         | 134.98 / 15.73 / 134.69  | 139.72 / 15.62 / 142.34       |
+| Scenario                          | CPU ms A1 / B / A2        | Sampled peak RSS MiB A1 / B / A2 | Ping p99 ms A1 / B / A2   | Event-loop p99 ms A1 / B / A2 |
+| --------------------------------- | ------------------------- | -------------------------------- | ------------------------- | ----------------------------- |
+| 1 tab, links off                  | 55.98 / 18.47 / 56.54     | 144.59 / 143.36 / 144.73         | 14.62 / 14.04 / 14.29     | 13.11 / 13.89 / 14.92         |
+| 10 tabs, links off                | 462.61 / 19.61 / 464.76   | 156.23 / 143.73 / 156.17         | 136.95 / 14.26 / 140.15   | 133.17 / 15.59 / 136.31       |
+| 10 tabs, 8,194 torrents, 2 paths  | 9019.13 / 34.69 / 9140.65 | 453.31 / 201.52 / 454.36         | 2797.23 / 17.06 / 2860.18 | 1579.16 / 14.08 / 1608.52     |
+| 10 tabs, 1,000 torrents, 10 paths | 1955.77 / 30.85 / 1978.58 | 261.72 / 156.06 / 261.91         | 469.77 / 15.34 / 472.49   | 327.42 / 15.59 / 327.16       |
+| 10 tabs, slow client              | 788.68 / 37.91 / 774.31   | 203.97 / 144.38 / 204.06         | 129.63 / 13.28 / 126.49   | 42.47 / 4.16 / 40.04          |
+| 10 tabs, failed authentication    | 454.53 / 50.16 / 458.92   | 165.17 / 149.55 / 165.20         | 125.85 / 15.36 / 127.64   | 132.91 / 15.36 / 135.92       |
 
 The 8,194-torrent fixture reduced prepared SQL statements from 246,030 to 6,
 `dbstat` aggregates from 30 to 1, catalog requests from 30 to 1, tag creation
@@ -103,25 +110,26 @@ one-tab/no-links fixture reduced aggregates from 3 to 1, prepared statements
 from 18 to 6, request bodies from 102 bytes to 0, and response bodies from 27
 bytes to 6. These are fixture-specific counts, not production estimates.
 
-The large baseline's wall time and RSS drift between A1 and A2 is visible in the
-table. One-tab candidate event-loop p99 was 14.71 ms versus A1 13.46 ms and A2
-15.20 ms; no universal tail-latency regression bound is established. Candidate
-ping sample counts ranged from two to four in the short scenarios, so tail
-estimates are especially sparse. Full per-worker samples and summary
+The large baseline's median wall time varied from 8,484.86 to 8,619.97 ms
+between A1 and A2. One-tab candidate event-loop p99 was 13.89 ms versus A1 13.11
+ms and A2 14.92 ms; no universal tail-latency regression bound is established.
+Candidate ping sample counts ranged from two to four in the short scenarios, so
+tail estimates are especially sparse. Full per-worker samples and summary
 min/max/p50/p95/p99 distributions remain in the external result archive; with
 only five workers, the summarized p95 and p99 are the maximum worker.
 
 ## Correctness and acceptance
 
-Build, format, lint, typecheck, and the final full suite passed: 79 cross-seed,
-3 shared, and 1 web UI tests (83 total). Actual compiled-router smoke passed.
-The added tests cover TTL/error recovery, manual refresh, configuration changes
-including an old-flight join, cancellation/deadline behavior, stale samples,
-version/authentication errors, cold and expired session coalescing, real linking
-outcomes, probe cleanup, and Deluge capability/session behavior. Linking tests
-preserve file bytes, directory entries, and final inode link counts; temporary
-hardlink probes can still change inode metadata. Non-qB enumeration fallback can
-still hydrate or reconcile client metadata.
+Build, format, lint, typecheck, and the post-handshake-fix full suite passed: 81
+cross-seed, 3 shared, and 1 web UI tests (85 total). The final compiled
+full-router matrix passed all 90 workers, including coalescing and outcome
+assertions. The added tests cover TTL/error recovery, manual refresh,
+configuration changes including an old-flight join, cancellation/deadline
+behavior, stale samples, version/authentication errors, cold and expired session
+coalescing, real linking outcomes, probe cleanup, and Deluge capability/session
+behavior. Linking tests preserve file bytes, directory entries, and final inode
+link counts; temporary hardlink probes can still change inode metadata. Non-qB
+enumeration fallback can still hydrate or reconcile client metadata.
 
 A full-suite run exposed the existing saved-torrent deletion race in
 `injects saved torrents into a fake client`. The same test failed in one of five
@@ -131,10 +139,12 @@ changed. UI builds/types and server refresh behavior were checked; a browser
 click-through was not performed.
 
 All 90 workers used identical instrumentation; compiled hashes were identical
-within each A1/B/A2 phase. Production source hashes remained unchanged after
-timing. The frozen pre-documentation source-tree digest was
-`4464b79fbac08212cecc798d1a81cedbfe250007a5ea80eb099f75c2f61b18ca`. External
-evidence lives under `next-audit/results/health`: `matrix/samples.json`, 90
-worker logs, `summary.json`, `frozen-manifest.json`, RED/green logs, and gate
-logs. Raw measurements and machine-specific paths are excluded from Git. No
-production or private client requests were made.
+within each A1/B/A2 phase. Production and registered-provider source/dist hashes
+matched the frozen manifest after timing. Final evidence lives under
+`next-audit/results/health/final-v2`: `matrix/samples.json`, 90 worker logs,
+`controller.log`, `summary.json`, `complete.json`, and `frozen-manifest.json`.
+The preceding matrix and RED/green/gate logs remain under
+`next-audit/results/health`, including `handshake-red.txt`,
+`handshake-green.txt`, and `handshake-gates`. Raw measurements and
+machine-specific paths are excluded from Git. No production or private client
+requests were made.

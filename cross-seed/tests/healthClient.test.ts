@@ -172,6 +172,53 @@ describe.sequential("real health adapters and disposable linking", () => {
 		status = 200;
 	}, 15_000);
 
+	it("rejects a forbidden post-login version handshake and recovers on the same client", async () => {
+		const cold = new QBittorrent(address, "forbidden-handshake", 1, false);
+		status = 403;
+		try {
+			const result = await Promise.race([
+				cold.validateConfig({ healthOnly: true }).then(
+					() => "unexpected success",
+					(error: Error) => error.message,
+				),
+				new Promise<string>((resolve) =>
+					setTimeout(() => resolve("handshake did not settle"), 1500),
+				),
+			]);
+			expect(result).toContain("failed with code 403");
+		} finally {
+			status = 200;
+		}
+		// Another expired-cookie request must not join the permanently pending handshake.
+		cold.cookie = "SID=expired";
+		await cold.validateConfig({ healthOnly: true });
+	});
+	it("clears the shared router flight after a forbidden login handshake so refresh can recover", async () => {
+		const cold = new QBittorrent(address, "router-handshake", 1, false);
+		setClientsForTesting([cold]);
+		status = 403;
+		try {
+			const failed = await caller.refresh();
+			expect(failed.problems).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						id: "client:validation:qbittorrent@router-handshake",
+						severity: "error",
+					}),
+				]),
+			);
+			status = 200;
+			const recovered = await caller.refresh();
+			expect(
+				recovered.problems.some((problem) =>
+					problem.id.startsWith("client:validation:"),
+				),
+			).toBe(false);
+		} finally {
+			status = 200;
+			setClientsForTesting([client]);
+		}
+	});
 	it("reports failed preferences requests when validating torrentDir instead of accepting an empty error response", async () => {
 		await writeFile(join(source, "fixture.fastresume"), "fixture");
 		setRuntimeConfig({
