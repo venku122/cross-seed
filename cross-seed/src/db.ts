@@ -1,9 +1,10 @@
-import { unlink } from "fs/promises";
+import { access, unlink } from "fs/promises";
 import knex from "knex";
 import type { Knex } from "knex";
 import BetterSqlite3ClientImport from "knex/lib/dialects/better-sqlite3/index.js";
 import ms from "ms";
 import { DatabaseSync } from "node:sqlite";
+import { setImmediate } from "node:timers/promises";
 import { basename, join } from "path";
 import { getClients } from "./clients/TorrentClient.js";
 import { appDir } from "./configuration.js";
@@ -26,7 +27,6 @@ import {
 	getLogString,
 	humanReadableDate,
 	inBatches,
-	notExists,
 	yieldToEventLoop,
 } from "./utils.js";
 
@@ -128,6 +128,119 @@ export const db = knex({
 	useNullAsDefault: true,
 });
 
+/**
+ * Merge indexed path streams so each filesystem path is checked once, including
+ * paths with multiple ensemble memberships. Keysets remain valid after deletes;
+ * watcher inserts behind the cursor are picked up by the next cleanup.
+ */
+async function pruneMissingCachedPaths(
+	dataDirs: string[],
+	seasonFromEpisodes: number | undefined,
+): Promise<void> {
+	let lastPath: string | undefined;
+	let processed = 0;
+	let pages = 0;
+	for (;;) {
+		const pathsFrom = (table: "data" | "ensemble") => {
+			const query = db<{ path: string }>(table)
+				.select("path")
+				.whereNotNull("path");
+			if (lastPath !== undefined) query.where("path", ">", lastPath);
+			return query;
+		};
+		const query = dataDirs.length
+			? pathsFrom("data")
+			: pathsFrom("ensemble");
+		if (dataDirs.length && seasonFromEpisodes) {
+			query.union(pathsFrom("ensemble"));
+		} else {
+			query.distinct("path");
+		}
+		const page = await query.orderBy("path", "asc").limit(512);
+		if (!page.length) return;
+		lastPath = page[page.length - 1].path;
+		let uncertainPaths = 0;
+		const missingPaths: string[] = [];
+		await inBatches(
+			page,
+			async (batch) => {
+				missingPaths.push(
+					...(await filterAsync(
+						batch.map(({ path }) => path),
+						async (path) => {
+							try {
+								await access(path);
+								return false;
+							} catch (error) {
+								const code = (error as NodeJS.ErrnoException)
+									.code;
+								if (code === "ENOENT" || code === "ENOTDIR")
+									return true;
+								uncertainPaths++;
+								return false;
+							}
+						},
+					)),
+				);
+			},
+			{ batchSize: 64 },
+		);
+		if (missingPaths.length) {
+			// Guard only destructive pages. An unavailable root is not evidence
+			// of deleted files; stop filesystem pruning but allow housekeeping.
+			let unavailableRoot = false;
+			await inBatches(
+				dataDirs,
+				async (roots) => {
+					await Promise.all(
+						roots.map(async (root) => {
+							try {
+								await access(root);
+							} catch {
+								unavailableRoot = true;
+							}
+						}),
+					);
+				},
+				{ batchSize: 64 },
+			);
+			if (unavailableRoot) {
+				logger.warn({
+					label: Label.CLEANUP,
+					message:
+						"Skipping filesystem cache pruning because a configured data root is unavailable...",
+				});
+				return;
+			}
+			await inBatches(
+				missingPaths,
+				async (batch) => {
+					await db.transaction(async (trx) => {
+						await trx("data").whereIn("path", batch).del();
+						await trx("ensemble").whereIn("path", batch).del();
+					});
+				},
+				{ batchSize: 64 },
+			);
+		}
+		if (uncertainPaths) {
+			logger.verbose({
+				label: Label.CLEANUP,
+				message: `Retained ${uncertainPaths} cached paths due to filesystem access errors...`,
+			});
+		}
+		processed += page.length;
+		if (++pages % 100 === 0) {
+			logger.verbose({
+				label: Label.CLEANUP,
+				message: `Checked ${processed} cached filesystem paths...`,
+			});
+		}
+		if (page.length < 512) return;
+		await setImmediate();
+	}
+}
+
 export async function cleanupDB(): Promise<void> {
 	const {
 		dataDirs,
@@ -175,40 +288,13 @@ export async function cleanupDB(): Promise<void> {
 				.merge();
 		});
 	})();
-	await (async () => {
-		if (!dataDirs.length) return;
+	if (dataDirs.length || seasonFromEpisodes) {
 		logger.verbose({
 			label: Label.CLEANUP,
-			message: "Pruning deleted dataDirs entries...",
+			message: "Pruning deleted cached filesystem entries...",
 		});
-		const deletedPaths = await filterAsync(
-			(await db<{ path: string }>("data").select("path")).map(
-				(e) => e.path,
-			),
-			(p) => notExists(p),
-		);
-		await inBatches(deletedPaths, async (batch) => {
-			await db("data").whereIn("path", batch).del();
-			await db("ensemble").whereIn("path", batch).del();
-		});
-	})();
-	await (async () => {
-		if (!seasonFromEpisodes) return;
-		logger.verbose({
-			label: Label.CLEANUP,
-			message: "Pruning deleted ensemble entries...",
-		});
-		const deletedPaths = await filterAsync(
-			(await db<{ path: string }>("ensemble").select("path")).map(
-				(e) => e.path,
-			),
-			(p) => notExists(p),
-		);
-		await inBatches(deletedPaths, async (batch) => {
-			await db("data").whereIn("path", batch).del();
-			await db("ensemble").whereIn("path", batch).del();
-		});
-	})();
+		await pruneMissingCachedPaths(dataDirs, seasonFromEpisodes);
+	}
 	(() => {
 		logger.verbose({
 			label: Label.CLEANUP,
