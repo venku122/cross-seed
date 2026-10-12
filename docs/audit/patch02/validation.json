@@ -1,0 +1,61 @@
+{
+	"baselineSha": "8a0c428edb9f8439e5138261047d2d0e3b3a4b78",
+	"candidateSourceSha256": "958163f9f0678ad824d229ff29570fc5eedef2746ff34d79325811fcc854c88b",
+	"compiledModuleSha256": "a3035a8d2363a163f76e51e7d9d0475be6a1e1f5d382ea173d5e7470e319f956",
+	"lockfileSha256": "88da27532b3b03440bbae2726942de02d7cff581b83be9374410e2426a5b285d",
+	"node": "26.11.1",
+	"dependencyInstall": {
+		"command": "npm ci",
+		"status": "passed in baseline worktree; identical lockfile dependencies shared via local workspace links"
+	},
+	"checks": [
+		{
+			"command": "npm run format:check",
+			"status": "passed"
+		},
+		{
+			"command": "npm run build",
+			"status": "passed"
+		},
+		{
+			"command": "npm run lint",
+			"status": "passed"
+		},
+		{
+			"command": "npm run typecheck",
+			"status": "passed"
+		},
+		{
+			"command": "CI=1 npm run test",
+			"status": "passed"
+		}
+	],
+	"tests": {
+		"backend": 81,
+		"shared": 3,
+		"webui": 1,
+		"total": 85,
+		"cleanup": 21
+	},
+	"redEvidence": {
+		"baselineFailures": 9,
+		"baselinePasses": 5,
+		"timerRegression": "one zero-duration sleep timer observed before scheduling correction"
+	},
+	"benchmarks": {
+		"initialWorkers": 105,
+		"finalWorkers": 105,
+		"mode": "five A/B/A rounds, migrated in-memory SQLite, production compiled cleanup and serve()/api/ping with synthetic access mocks",
+		"largeSamples": "five candidate cold operations, ten baseline cold operations per large fixture",
+		"realNfs": false,
+		"allPathsAccessible": true,
+		"rootGuardDelayMs": 0
+	},
+	"packageSmoke": "passed: isolated npm pack/install and Node26 CLI --version via controller staging",
+	"reviewFollowup": {
+		"tests": 90,
+		"cleanupTests": 26,
+		"allWorkspaceGates": "passed",
+		"historicalFields": "Older package/benchmark fields refer to original pre-review validation; current benchmark evidence is external and linked from PR"
+	}
+}
