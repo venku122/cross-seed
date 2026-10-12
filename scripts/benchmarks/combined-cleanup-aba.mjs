@@ -3,14 +3,43 @@ import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { resolve, join } from "node:path";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { cpus, arch, platform, totalmem } from "node:os";
 const [baseline, candidate, destination] = process.argv
 	.slice(2)
 	.map((value) => resolve(value));
+assert.ok(
+	!fs.existsSync(join(destination, "samples.jsonl")),
+	"Use a fresh output directory; preserve previous captures",
+);
 fs.mkdirSync(destination, { recursive: true });
 const worker = fileURLToPath(
 	new URL("./combined-cleanup.mjs", import.meta.url),
 );
 const expected = {};
+const digestFile = (path) =>
+	createHash("sha256").update(fs.readFileSync(path)).digest("hex");
+fs.writeFileSync(
+	join(destination, "environment.json"),
+	JSON.stringify(
+		{
+			node: process.version,
+			platform: platform(),
+			arch: arch(),
+			cpuModel: cpus()[0].model,
+			totalMemoryBytes: totalmem(),
+			baseline,
+			candidate,
+			expectedWorkers: 60,
+			rounds: 5,
+			controllerSha256: digestFile(new URL(import.meta.url)),
+			workerSha256: digestFile(worker),
+			scope: "Local synthetic compiled qB full cleanup; run exclusively; no NFS/ZFS or production invocation weighting",
+		},
+		null,
+		2,
+	),
+);
 let completed = 0;
 for (const count of [8194, 30000]) {
 	for (const aliases of [1, 5]) {
@@ -33,6 +62,7 @@ for (const count of [8194, 30000]) {
 					{
 						encoding: "utf8",
 						maxBuffer: 32 * 1024 * 1024,
+						timeout: 180_000,
 						env: {
 							...process.env,
 							BENCH_FILES: "50",

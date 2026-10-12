@@ -11,6 +11,7 @@ import bencode from "bencode";
 import { fork, execFileSync } from "node:child_process";
 import { createServer } from "node:net";
 import { performance, monitorEventLoopDelay } from "node:perf_hooks";
+import { createHash } from "node:crypto";
 
 const quantiles = (values) => {
 	const sorted = values.slice().sort((a, b) => a - b);
@@ -142,6 +143,16 @@ if (process.argv[2] === "ping") {
 					throw new Error(
 						"Actual generator instrumentation anchor missing",
 					);
+				globalThis.__combinedPerf.originalGeneratorSha256 = createHash(
+					"sha256",
+				)
+					.update(before)
+					.digest("hex");
+				globalThis.__combinedPerf.executedGeneratorSha256 = createHash(
+					"sha256",
+				)
+					.update(after)
+					.digest("hex");
 				loaded.source = after;
 			}
 			return loaded;
