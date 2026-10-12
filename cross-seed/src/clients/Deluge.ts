@@ -119,14 +119,38 @@ export default class Deluge implements TorrentClient {
 	/**
 	 * validates the login and host for deluge webui
 	 */
-	async validateConfig(): Promise<void> {
+	async validateConfig(options?: { healthOnly?: boolean }): Promise<void> {
 		const { torrentDir } = getRuntimeConfig();
-		await this.authenticate();
+		if (options?.healthOnly) {
+			if (!this.delugeCookie) await this.authenticate(true);
+			let status = await this.call<boolean>("web.connected", [], 0);
+			if (
+				status.isErr() &&
+				status.unwrapErr().code === DelugeErrorCode.NO_AUTH
+			) {
+				this.delugeCookie = null;
+				await this.authenticate(true);
+				status = await this.call<boolean>("web.connected", [], 0);
+			}
+			const connected = status.unwrapOrThrow(
+				new CrossSeedError(
+					`[${this.label}] Failed to reach Deluge daemon`,
+				),
+			);
+			if (!connected)
+				throw new CrossSeedError(
+					`[${this.label}] Deluge WebUI disconnected from daemon`,
+				);
+			this.isLabelEnabled = await this.labelEnabled(true);
+		} else {
+			await this.authenticate();
+		}
 		logger.info({
 			label: this.label,
 			message: `Logged in successfully${this.readonly ? " (readonly)" : ""}`,
 		});
-		await this.call<boolean>("auth.delete_session", [], 0);
+		if (!options?.healthOnly)
+			await this.call<boolean>("auth.delete_session", [], 0);
 		if (!torrentDir) return;
 		if (!(await readdir(torrentDir)).some((f) => f.endsWith(".state"))) {
 			throw new CrossSeedError(
@@ -138,7 +162,7 @@ export default class Deluge implements TorrentClient {
 	/**
 	 * connects and authenticates to the webui
 	 */
-	async authenticate(): Promise<void> {
+	async authenticate(healthOnly = false): Promise<void> {
 		const { href, password } = extractCredentialsFromUrl(
 			this.url,
 		).unwrapOrThrow(
@@ -173,6 +197,17 @@ export default class Deluge implements TorrentClient {
 			[],
 			0,
 		);
+		if (healthOnly) {
+			if (
+				!isConnectedResponse.unwrapOrThrow(
+					new CrossSeedError("Failed to check Deluge connectivity"),
+				)
+			)
+				throw new CrossSeedError(
+					`[${this.label}] Deluge WebUI disconnected from daemon`,
+				);
+			return;
+		}
 		if (isConnectedResponse.isOk() && !isConnectedResponse.unwrap()) {
 			logger.warn({
 				label: this.label,
@@ -319,10 +354,11 @@ export default class Deluge implements TorrentClient {
 	 * checks enabled plugins for "Label"
 	 * @return boolean declaring whether the "Label" plugin is enabled
 	 */
-	private async labelEnabled() {
+	private async labelEnabled(healthOnly = false) {
 		const enabledPlugins = await this.call<string>(
 			"core.get_enabled_plugins",
 			[],
+			healthOnly ? 0 : 1,
 		);
 		if (enabledPlugins.isOk()) {
 			return enabledPlugins.unwrap().includes("Label");

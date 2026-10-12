@@ -123,17 +123,17 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const { data: buildInfoResponse } = useSuspenseQuery(
     trpc.meta.getBuildInfo.queryOptions(),
   );
-  const { data: healthData } = useQuery({
+  const { data: healthData, error: healthError } = useQuery({
     ...trpc.health.get.queryOptions(),
     refetchInterval: 60_000,
   });
-  const healthStatus = healthData?.problems.some(
-    (problem) => problem.severity === "error",
-  )
-    ? "error"
-    : healthData?.problems.some((problem) => problem.severity === "warning")
-      ? "warning"
-      : undefined;
+  const healthStatus =
+    healthError ||
+    healthData?.problems.some((problem) => problem.severity === "error")
+      ? "error"
+      : healthData?.problems.some((problem) => problem.severity === "warning")
+        ? "warning"
+        : undefined;
   const buildInfo = buildInfoResponse?.build;
   const buildVersion = buildInfoResponse?.version;
   const buildTag = buildInfo?.tag ?? buildVersion;

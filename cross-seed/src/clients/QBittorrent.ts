@@ -180,6 +180,7 @@ interface CategoryInfo {
 
 export default class QBittorrent implements TorrentClient {
 	cookie: string;
+	private healthLogin: Promise<void> | undefined;
 	url: { username: string; password: string; href: string };
 	version: string;
 	versionMajor: number;
@@ -208,7 +209,19 @@ export default class QBittorrent implements TorrentClient {
 		);
 	}
 
-	async login(): Promise<void> {
+	async login(healthOnly = false): Promise<void> {
+		if (!healthOnly) return this.performLogin(false);
+		if (this.healthLogin) return this.healthLogin;
+		const pending = this.performLogin(true);
+		this.healthLogin = pending;
+		try {
+			await pending;
+		} finally {
+			if (this.healthLogin === pending) this.healthLogin = undefined;
+		}
+	}
+
+	private async performLogin(healthOnly: boolean): Promise<void> {
 		let response: Response;
 		const { href, username, password } = this.url;
 		try {
@@ -240,12 +253,24 @@ export default class QBittorrent implements TorrentClient {
 			"/app/version",
 			"",
 			X_WWW_FORM_URLENCODED,
+			healthOnly ? 1 : 3,
+			healthOnly,
 		);
 		if (!version) {
 			throw new CrossSeedError(
 				`qBittorrent login failed: Unable to retrieve version`,
 			);
 		}
+		this.checkVersion(version, healthOnly);
+		logger.info({
+			label: this.label,
+			message: `Logged in to ${this.version} successfully${this.readonly ? " (readonly)" : ""}`,
+		});
+	}
+
+	private checkVersion(version: string, healthOnly = false): void {
+		if (healthOnly && !/^v?\d+\.\d+\.\d+/i.test(version))
+			throw new CrossSeedError("Unable to retrieve qBittorrent version");
 		this.version = version;
 		this.versionMajor = extractInt(this.version);
 		this.versionMinor = extractInt(this.version.split(".")[1]);
@@ -261,23 +286,36 @@ export default class QBittorrent implements TorrentClient {
 				`qBittorrent minimum supported version is v4.3.1, current version is ${this.version}`,
 			);
 		}
-		logger.info({
-			label: this.label,
-			message: `Logged in to ${this.version} successfully${this.readonly ? " (readonly)" : ""}`,
-		});
 	}
 
-	async validateConfig(): Promise<void> {
+	async validateConfig(options?: { healthOnly?: boolean }): Promise<void> {
 		const { torrentDir } = getRuntimeConfig();
 		try {
-			await this.login();
+			if (!options?.healthOnly || !this.cookie) {
+				await this.login(Boolean(options?.healthOnly));
+			} else {
+				const version = await this.request(
+					"/app/version",
+					"",
+					X_WWW_FORM_URLENCODED,
+					1,
+					true,
+				);
+				if (!version)
+					throw new CrossSeedError(
+						"Unable to retrieve qBittorrent version",
+					);
+				this.checkVersion(version, true);
+			}
 		} catch (e) {
 			throw new CrossSeedError(`[${this.label}] ${errorMessage(e)}`);
 		}
-		await this.createTag();
+		if (!options?.healthOnly) await this.createTag();
 
 		if (!torrentDir) return;
-		const { resume_data_storage_type } = await this.getPreferences();
+		const { resume_data_storage_type } = await this.getPreferences(
+			Boolean(options?.healthOnly),
+		);
 		if (resume_data_storage_type === "SQLite") {
 			throw new CrossSeedError(
 				`[${this.label}] torrentDir is not compatible with SQLite mode in qBittorrent, use https://www.cross-seed.org/docs/basics/options#useclienttorrents`,
@@ -297,6 +335,7 @@ export default class QBittorrent implements TorrentClient {
 		body: BodyInit,
 		headers: Record<string, string> = {},
 		numRetries = 3,
+		requireSuccess = false,
 	): Promise<string | undefined> {
 		const bodyStr =
 			body instanceof URLSearchParams || body instanceof FormData
@@ -315,10 +354,11 @@ export default class QBittorrent implements TorrentClient {
 					label: this.label,
 					message: `Making request (${retries - i}) to ${path} with body ${bodyStr}`,
 				});
+				const requestCookie = this.cookie;
 				response = await fetch(`${this.url.href}${path}`, {
 					method: "POST",
 					headers: {
-						Cookie: this.cookie,
+						Cookie: requestCookie,
 						"User-Agent": USER_AGENT,
 						...headers,
 					},
@@ -337,7 +377,8 @@ export default class QBittorrent implements TorrentClient {
 						label: this.label,
 						message: `Received 403 from API, re-authenticating and retrying (${retries - i} retries left)`,
 					});
-					await this.login();
+					if (!requireSuccess || this.cookie === requestCookie)
+						await this.login(requireSuccess);
 					await wait(
 						Math.min(ms("1 second") * 2 ** i, ms("10 seconds")),
 					);
@@ -378,14 +419,20 @@ export default class QBittorrent implements TorrentClient {
 				continue;
 			}
 		}
+		if (requireSuccess && !response?.ok)
+			throw new CrossSeedError(
+				`qBittorrent health request failed with code ${response?.status ?? "unavailable"}`,
+			);
 		return response?.text();
 	}
 
-	async getPreferences(): Promise<Preferences> {
+	async getPreferences(healthOnly = false): Promise<Preferences> {
 		const responseText = await this.request(
 			"/app/preferences",
 			"",
 			X_WWW_FORM_URLENCODED,
+			healthOnly ? 1 : 3,
+			healthOnly,
 		);
 		if (!responseText) {
 			throw new CrossSeedError(
@@ -689,6 +736,39 @@ export default class QBittorrent implements TorrentClient {
 		const responseText = await this.request("/torrents/info", params);
 		if (!responseText) return [];
 		return JSON.parse(responseText) as TorrentInfo[];
+	}
+
+	/** Read save paths for status without hydrating or mutating cached metadata. */
+	async getHealthSavePaths(): Promise<string[]> {
+		if (!this.cookie) await this.login(true);
+		const response = await this.request(
+			"/torrents/info",
+			new URLSearchParams(),
+			{},
+			1,
+			true,
+		);
+		if (!response)
+			throw new CrossSeedError(
+				"qBittorrent returned no save-path information",
+			);
+		const torrents: unknown = JSON.parse(response);
+		if (
+			!Array.isArray(torrents) ||
+			torrents.some(
+				(torrent: unknown) =>
+					!torrent ||
+					typeof torrent !== "object" ||
+					!("save_path" in torrent) ||
+					typeof torrent.save_path !== "string",
+			)
+		)
+			throw new CrossSeedError(
+				"qBittorrent returned invalid save-path information",
+			);
+		return (torrents as { save_path: string }[]).map(
+			(torrent) => torrent.save_path,
+		);
 	}
 
 	/*

@@ -1,3 +1,4 @@
+import { invalidateHealth } from "./healthGeneration.js";
 import { readdir, stat } from "fs/promises";
 import { basename, dirname, isAbsolute, join, relative } from "path";
 import ms from "ms";
@@ -422,6 +423,7 @@ export async function updateSearcheeClientDB(
 				.merge();
 		},
 	);
+	if (newSearchees.length || removedInfoHashes.length) invalidateHealth();
 }
 
 export interface ClientSearcheeRow {
