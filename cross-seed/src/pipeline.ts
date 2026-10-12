@@ -449,12 +449,15 @@ async function getEnsembleForCandidate(
 	const ensemble = await db<{
 		client_host: string | null;
 		path: string;
+		info_hash: string | null;
+		ensemble: string;
 		element: string;
 	}>("ensemble")
 		.whereIn("ensemble", keys)
-		// Deduplication below keeps the first source for each episode. Preserve
-		// table-scan order when the ensemble index groups alternate title keys.
-		.orderBy("rowid");
+		// Suppress only exact memberships before filesystem checks. Preserve the
+		// first row's source order across aliases, hosts, hashes and episodes.
+		.groupBy("client_host", "path", "info_hash", "ensemble", "element")
+		.orderByRaw("MIN(rowid)");
 	if (ensemble.length === 0) {
 		logger.verbose({
 			label: searcheeLabel,
@@ -466,7 +469,7 @@ async function getEnsembleForCandidate(
 	const entriesToDelete = new Set<string>();
 	const hosts = new Map<string, number>();
 	const filesWithElement = await reduceAsync<
-		{ client_host: string | null; path: string; element: string },
+		(typeof ensemble)[number],
 		(File & { element: string })[]
 	>(
 		ensemble,

@@ -40,6 +40,176 @@ describe.sequential("ensemble lookup", () => {
 			},
 		);
 	});
+
+	async function lookup() {
+		const { checkNewCandidateMatch } = await import("../src/pipeline.js");
+		const { Label } = await import("../src/logger.js");
+		await checkNewCandidateMatch(
+			{
+				name: "Zulu.Show.AKA.Alpha.Show.S01.1080p.WEB",
+				guid: "synthetic-season",
+				link: "http://unused.invalid",
+				tracker: "synthetic",
+			},
+			Label.RSS,
+		);
+	}
+
+	it("checks exact repeated memberships once before filesystem I/O", async () => {
+		await db.migrate.latest();
+		const path = join(root, "episode.mkv");
+		await writeFile(path, "episode");
+		const row = {
+			client_host: null,
+			path,
+			info_hash: null,
+			ensemble: "zulushow.S1",
+			element: "1",
+		};
+		await db("ensemble").insert([row, row, row]);
+		const utils = await import("../src/utils.js");
+		const existence = vi.spyOn(utils, "notExists");
+		await lookup();
+		expect(existence.mock.calls.filter(([p]) => p === path)).toHaveLength(
+			1,
+		);
+		expect(assessed.length).toBeGreaterThan(0);
+		for (const searchee of assessed) {
+			expect(searchee.files.map((file) => file.path)).toEqual([path]);
+			expect(searchee.length).toBe(7);
+		}
+		// Suppressing lookup work does not repair stored duplicate memberships.
+		expect(await db("ensemble").count({ n: "*" }).first()).toEqual({
+			n: 3,
+		});
+		// Deduplication belongs to one lookup, never a persistent filesystem cache.
+		await lookup();
+		expect(existence.mock.calls.filter(([p]) => p === path)).toHaveLength(
+			2,
+		);
+	});
+
+	it("preserves distinct episode elements on the same physical path", async () => {
+		await db.migrate.latest();
+		const path = join(root, "episode.mkv");
+		await writeFile(path, "episode");
+		const row = {
+			client_host: null,
+			path,
+			info_hash: null,
+			ensemble: "zulushow.S1",
+			element: "1",
+		};
+		await db("ensemble").insert([row, { ...row, element: "2" }, row]);
+		const utils = await import("../src/utils.js");
+		const existence = vi.spyOn(utils, "notExists");
+		await lookup();
+		expect(existence.mock.calls.filter(([p]) => p === path)).toHaveLength(
+			2,
+		);
+		expect(assessed[0].files.map((file) => file.path)).toEqual([
+			path,
+			path,
+		]);
+		expect(assessed[0].length).toBe(14);
+	});
+
+	it("observes aliases, different hashes and null versus empty origins separately", async () => {
+		await db.migrate.latest();
+		const path = join(root, "episode.mkv");
+		await writeFile(path, "episode");
+		const row = {
+			client_host: null as string | null,
+			path,
+			info_hash: null as string | null,
+			ensemble: "zulushow.S1",
+			element: "1",
+		};
+		const rows = [
+			row,
+			{ ...row, ensemble: "alphashow.S1" },
+			{ ...row, info_hash: "hash-a" },
+			{ ...row, info_hash: "hash-b" },
+			{ ...row, client_host: "" },
+			{ ...row, client_host: "client-a" },
+			{ ...row, client_host: "client-b" },
+		];
+		await db("ensemble").insert([...rows, row]);
+		const utils = await import("../src/utils.js");
+		const existence = vi.spyOn(utils, "notExists");
+		await lookup();
+		expect(existence.mock.calls.filter(([p]) => p === path)).toHaveLength(
+			7,
+		);
+		// Existing episode-source suppression remains independent of membership
+		// suppression: null and empty origins differ in its source identity too.
+		expect(assessed[0].files.map((file) => file.path)).toEqual([
+			path,
+			path,
+			path,
+			path,
+		]);
+	});
+
+	it("does not collide delimiter-containing membership values", async () => {
+		await db.migrate.latest();
+		const first = join(root, "a|b");
+		const second = join(root, "a");
+		await writeFile(first, "episode");
+		await writeFile(second, "longer episode");
+		const row = {
+			client_host: null,
+			path: first,
+			info_hash: "c",
+			ensemble: "zulushow.S1",
+			element: "1",
+		};
+		await db("ensemble").insert([
+			row,
+			{ ...row, path: second, info_hash: "b|c" },
+			row,
+		]);
+		const utils = await import("../src/utils.js");
+		const existence = vi.spyOn(utils, "notExists");
+		await lookup();
+		expect(existence.mock.calls.filter(([p]) => p === first)).toHaveLength(
+			1,
+		);
+		expect(existence.mock.calls.filter(([p]) => p === second)).toHaveLength(
+			1,
+		);
+		expect(assessed[0].files.map((file) => file.path)).toEqual([
+			first,
+			second,
+		]);
+	});
+
+	it("checks repeated missing paths once and retains existing path-wide cleanup", async () => {
+		await db.migrate.latest();
+		const path = join(root, "missing.mkv");
+		const row = {
+			client_host: null,
+			path,
+			info_hash: null,
+			ensemble: "zulushow.S1",
+			element: "1",
+		};
+		await db("ensemble").insert([
+			row,
+			row,
+			{ ...row, ensemble: "unrelated.S1" },
+		]);
+		await db("data").insert({ path, title: "Unrelated source" });
+		const utils = await import("../src/utils.js");
+		const existence = vi.spyOn(utils, "notExists");
+		await lookup();
+		expect(existence.mock.calls.filter(([p]) => p === path)).toHaveLength(
+			1,
+		);
+		expect(await db("ensemble").where({ path })).toEqual([]);
+		expect(await db("data").where({ path })).toEqual([]);
+		expect(assessed).toEqual([]);
+	});
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		await db.destroy();
