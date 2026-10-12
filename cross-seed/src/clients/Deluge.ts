@@ -1,3 +1,4 @@
+import { cachedClientTorrents } from "./clientCache.js";
 import { humanReadableSize } from "@cross-seed/shared/utils";
 import { readdir } from "fs/promises";
 import ms from "ms";
@@ -10,14 +11,12 @@ import {
 	TORRENT_TAG,
 	USER_AGENT,
 } from "../constants.js";
-import { db } from "../db.js";
 import { CrossSeedError } from "../errors.js";
 import { Label, logger } from "../logger.js";
 import { Metafile } from "../parseTorrent.js";
 import { Result, resultOf, resultOfErr } from "../Result.js";
 import { getRuntimeConfig } from "../runtimeConfig.js";
 import {
-	ClientSearcheeRow,
 	createSearcheeFromDB,
 	parseTitle,
 	Searchee,
@@ -789,37 +788,51 @@ export default class Deluge implements TorrentClient {
 			});
 			return { searchees, newSearchees };
 		}
-		for (const [hash, torrent] of Object.entries(torrents)) {
-			const infoHash = hash.toLowerCase();
+		for await (const {
+			torrent: entry,
+			infoHash,
+			useCache,
+			dbTorrent,
+		} of cachedClientTorrents(
+			Object.entries(torrents),
+			this.clientHost,
+			([hash]) => hash.toLowerCase(),
+			([, torrent], dbTorrent, infoHash) => {
+				const name = torrent.name!;
+				const savePath = torrent.save_path!;
+				const category = torrent.label ?? "";
+				const modified = clientSearcheeModified(
+					this.label,
+					dbTorrent,
+					name,
+					savePath,
+					{
+						category,
+					},
+				);
+				const refresh =
+					options?.refresh === undefined
+						? false
+						: options.refresh.length === 0
+							? true
+							: options.refresh.includes(infoHash);
+
+				return !modified && !refresh;
+			},
+			!options?.newSearcheesOnly && options?.refresh?.length !== 0,
+		)) {
+			const [, torrent] = entry;
 			infoHashes.add(infoHash);
-			const dbTorrent = await db<ClientSearcheeRow>("client_searchee")
-				.where("info_hash", infoHash)
-				.where("client_host", this.clientHost)
-				.first();
-			const name = torrent.name!;
-			const savePath = torrent.save_path!;
-			const category = torrent.label ?? "";
-			const modified = clientSearcheeModified(
-				this.label,
-				dbTorrent,
-				name,
-				savePath,
-				{
-					category,
-				},
-			);
-			const refresh =
-				options?.refresh === undefined
-					? false
-					: options.refresh.length === 0
-						? true
-						: options.refresh.includes(infoHash);
-			if (!modified && !refresh) {
+			if (useCache) {
 				if (!options?.newSearcheesOnly) {
 					searchees.push(createSearcheeFromDB(dbTorrent!));
 				}
 				continue;
 			}
+
+			const name = torrent.name!;
+			const savePath = torrent.save_path!;
+			const category = torrent.label ?? "";
 			const files = torrent.files!.map((file) => ({
 				name: basename(file.path),
 				path: file.path,
