@@ -26,10 +26,12 @@ operation that is still running.
 qB health validation retains version and torrentDir checks, uses its existing
 session, only reauthenticates when needed, and skips tag creation. Deluge status
 reuses its session and can refresh expired authentication, but never deletes the
-session or reconnects a disconnected daemon. Explicit default validation retains
-its existing side effects; startup currently instantiates clients without
-calling full validation. Deluge authentication still reads its Label plugin
-capability so health does not disable later injection labeling. qB uses a
+session or reconnects a disconnected daemon. Health login handshakes reject a
+forbidden version response without recursively joining their own shared
+authentication promise; later refreshes can recover. Explicit default validation
+retains its existing side effects; startup currently instantiates clients
+without calling full validation. Deluge authentication still reads its Label
+plugin capability so health does not disable later injection labeling. qB uses a
 dedicated lightweight save-path catalog read instead of hydrating/reconciling
 client metadata; other adapters retain their existing cached/coalesced
 enumeration. Actual linking and writable-directory diagnostics still create
@@ -72,6 +74,10 @@ also use the conservative five-second failure TTL.
 
 ## Measured results
 
+These 90 workers measured revision `061458bda47c6eb6805fa63f083a3cd9f6dce88e`,
+before the login-handshake recovery fix. A final frozen-source rerun is pending;
+the measurements below must not be treated as final-head evidence.
+
 All 90 fresh workers completed successfully in the exclusive timing slot on Node
 26.11.1 / SQLite 3.53.4. Each value below is the median across five workers; A1
 and A2 are pristine baseline runs surrounding candidate B. Every worker runs
@@ -113,9 +119,10 @@ only five workers, the summarized p95 and p99 are the maximum worker.
 
 ## Correctness and acceptance
 
-Build, format, lint, typecheck, and the final full suite passed: 79 cross-seed,
-3 shared, and 1 web UI tests (83 total). Actual compiled-router smoke passed.
-The added tests cover TTL/error recovery, manual refresh, configuration changes
+Build, format, lint, typecheck, and the post-handshake-fix full suite passed: 81
+cross-seed, 3 shared, and 1 web UI tests (85 total). The preceding revision also
+passed actual compiled-router smoke; final compiled timing rerun is pending. The
+added tests cover TTL/error recovery, manual refresh, configuration changes
 including an old-flight join, cancellation/deadline behavior, stale samples,
 version/authentication errors, cold and expired session coalescing, real linking
 outcomes, probe cleanup, and Deluge capability/session behavior. Linking tests

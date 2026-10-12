@@ -255,6 +255,8 @@ export default class QBittorrent implements TorrentClient {
 			X_WWW_FORM_URLENCODED,
 			healthOnly ? 1 : 3,
 			healthOnly,
+			// A health handshake cannot rejoin its own shared login promise.
+			!healthOnly,
 		);
 		if (!version) {
 			throw new CrossSeedError(
@@ -336,6 +338,7 @@ export default class QBittorrent implements TorrentClient {
 		headers: Record<string, string> = {},
 		numRetries = 3,
 		requireSuccess = false,
+		allowReauth = true,
 	): Promise<string | undefined> {
 		const bodyStr =
 			body instanceof URLSearchParams || body instanceof FormData
@@ -366,7 +369,7 @@ export default class QBittorrent implements TorrentClient {
 					signal: AbortSignal.timeout(ms("10 minutes")),
 				});
 				if (response.status === 403) {
-					if (i >= retries) {
+					if (!allowReauth || i >= retries) {
 						logger.error({
 							label: this.label,
 							message: `Received 403 from API after ${retries} retries`,
