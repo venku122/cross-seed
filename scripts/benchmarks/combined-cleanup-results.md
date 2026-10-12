@@ -92,11 +92,12 @@ reads zero cached file-JSON bytes versus 25.7/94.3MB baseline; full cache file
 JSON writes and final cache digests remain equivalent.
 
 **Whole-job memory is still large.** At 30k, sampled peak RSS rises 34.8–35.7%,
-from about 1,391MiB to 1,874–1,898MiB. Process peak (including fixture setup) falls
-only about 6%, from 2,109–2,129MiB to 1,984–2,010MiB. The baseline synchronous burst
-can evade the interval sampler, while candidate yields expose samples; these
-measures are not interchangeable or evidence of an equivalent whole-job memory
-reduction. Full catalog/file/searchee arrays remain materialized.
+from about 1,391MiB to 1,874–1,898MiB. Process peak (including fixture setup)
+falls only about 6%, from 2,109–2,129MiB to 1,984–2,010MiB. The baseline
+synchronous burst can evade the interval sampler, while candidate yields expose
+samples; these measures are not interchangeable or evidence of an equivalent
+whole-job memory reduction. Full catalog/file/searchee arrays remain
+materialized.
 
 30k/five aliases still has median HTTP maximum 545ms and loop maximum 546ms; its
 ping p99 median is399ms. JSON transport decoding and full refresh remain
