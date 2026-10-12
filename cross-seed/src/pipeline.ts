@@ -450,7 +450,11 @@ async function getEnsembleForCandidate(
 		client_host: string | null;
 		path: string;
 		element: string;
-	}>("ensemble").whereIn("ensemble", keys);
+	}>("ensemble")
+		.whereIn("ensemble", keys)
+		// Deduplication below keeps the first source for each episode. Preserve
+		// table-scan order when the ensemble index groups alternate title keys.
+		.orderBy("rowid");
 	if (ensemble.length === 0) {
 		logger.verbose({
 			label: searcheeLabel,
