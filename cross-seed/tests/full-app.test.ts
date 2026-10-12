@@ -318,15 +318,16 @@ describe.sequential("full app flows", () => {
 		const fakeClient = new FakeTorrentClient(fakeTorrent.server);
 		env.setClientsForTesting([fakeClient]);
 
-		const { injectSavedTorrents } = await import("../src/inject.js");
-		await injectSavedTorrents();
-
-		expect(fakeTorrent.state.torrents.has(meta.infoHash)).toBe(true);
 		const savedFiles = await readdir(outputDir);
 		const parsed = savedFiles
 			.map((file) => env.parseMetadataFromFilename(file))
 			.filter((entry) => entry.infoHash === meta.infoHash);
 		expect(parsed.length).toBeGreaterThanOrEqual(1);
+
+		const { injectSavedTorrents } = await import("../src/inject.js");
+		await injectSavedTorrents();
+
+		expect(fakeTorrent.state.torrents.has(meta.infoHash)).toBe(true);
 
 		await env.db.destroy();
 	});
