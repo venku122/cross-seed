@@ -24,6 +24,56 @@ let configDir: string;
 let setConfig: typeof import("../src/runtimeConfig.js").setRuntimeConfig;
 let defaults: typeof import("../src/configuration.js").getDefaultRuntimeConfig;
 
+import ownershipMigration from "../src/migrations/19-source-ownership.js";
+import {
+	type SourceOrigin,
+	sourceMembershipQuery,
+	replaceSourcePublication,
+	tombstoneSourceOrigin,
+} from "../src/sourceStore.js";
+
+const visibleMemberships = () =>
+	env.db().from(sourceMembershipQuery(env.db).as("visible_memberships"));
+const visibleData = () =>
+	env
+		.db("data")
+		.where((query) =>
+			query
+				.whereNull("path")
+				.orWhereNotIn(
+					"path",
+					env
+						.db<SourceOrigin>("source_origin")
+						.select(env.db.raw("json_extract(metadata, '$.path')"))
+						.where("state", "unavailable")
+						.whereRaw(
+							"json_extract(metadata, '$.path') IS NOT NULL",
+						),
+				),
+		);
+async function publishPath(path: string, memberships = 1) {
+	const origin = await env
+		.db<SourceOrigin>("source_origin")
+		.where({ namespace_id: "legacy-unknown" })
+		.whereRaw("json_extract(metadata, '$.path') = ?", [path])
+		.first();
+	expect(origin).toBeDefined();
+	if (!origin) throw new Error("Fixture origin not present");
+	expect(
+		await replaceSourcePublication(env.db, {
+			originId: origin.id,
+			expectedRevision: origin.revision,
+			revision: origin.revision + 1,
+			status: "verified",
+			metadata: JSON.parse(origin.metadata),
+			memberships: Array.from({ length: memberships }, (_, member) => ({
+				path,
+				ensemble: `alternate-${member}`,
+				element: "1",
+			})),
+		}),
+	).toBe(true);
+}
 const missing = (code = "ENOENT") => Object.assign(new Error(code), { code });
 
 async function seed(paths: (string | null)[], memberships = 1) {
@@ -46,6 +96,7 @@ async function seed(paths: (string | null)[], memberships = 1) {
 			);
 		}
 	}
+	await ownershipMigration.up(env.db);
 }
 
 describe.sequential("cleanup cached filesystem paths", () => {
@@ -72,6 +123,14 @@ describe.sequential("cleanup cached filesystem paths", () => {
 		await rm(configDir, { recursive: true, force: true });
 	});
 	beforeEach(async () => {
+		for (const table of [
+			"source_alias",
+			"ensemble_membership",
+			"physical_path",
+			"source_origin",
+			"source_namespace",
+		])
+			await env.db(table).del();
 		await env.db("data").del();
 		await env.db("ensemble").del();
 		fs.check = () => Promise.resolve();
@@ -103,7 +162,7 @@ describe.sequential("cleanup cached filesystem paths", () => {
 		expect(peak).toBeLessThanOrEqual(64);
 		expect(checked.length).toBe(paths.length);
 		expect(new Set(checked)).toEqual(new Set(paths));
-		expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
+		expect(await visibleMemberships().count({ n: "*" }).first()).toEqual({
 			n: 5500,
 		});
 	});
@@ -135,8 +194,14 @@ describe.sequential("cleanup cached filesystem paths", () => {
 					? Promise.resolve()
 					: Promise.reject(missing());
 			await env.cleanupDB();
-			expect(await env.db("data")).toEqual([]);
-			expect(await env.db("ensemble")).toEqual([]);
+			expect(await visibleData()).toEqual([]);
+			expect(await visibleMemberships()).toEqual([]);
+			expect(await env.db("data").count({ n: "*" }).first()).toEqual({
+				n: count,
+			});
+			expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
+				n: count * 5,
+			});
 		},
 	);
 
@@ -149,10 +214,12 @@ describe.sequential("cleanup cached filesystem paths", () => {
 					? Promise.resolve()
 					: Promise.reject(missing(code));
 			await env.cleanupDB();
-			expect(await env.db("data").count({ n: "*" }).first()).toEqual({
+			expect(await visibleData().count({ n: "*" }).first()).toEqual({
 				n: 1,
 			});
-			expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
+			expect(
+				await visibleMemberships().count({ n: "*" }).first(),
+			).toEqual({
 				n: 5,
 			});
 		},
@@ -168,10 +235,10 @@ describe.sequential("cleanup cached filesystem paths", () => {
 				? Promise.reject(missing("ENOTDIR"))
 				: Promise.resolve();
 		await env.cleanupDB();
-		expect(await env.db("data").select("path")).toEqual([
+		expect(await visibleData().select("path")).toEqual([
 			{ path: "/synthetic/root/kept" },
 		]);
-		expect(await env.db("ensemble").pluck("ensemble")).toEqual([
+		expect(await visibleMemberships().pluck("ensemble")).toEqual([
 			"alternate-0",
 			"alternate-1",
 			"alternate-2",
@@ -203,10 +270,12 @@ describe.sequential("cleanup cached filesystem paths", () => {
 			await env.cleanupDB();
 			const enabled = dataEnabled || ensembleEnabled;
 			expect(calls).toBe(enabled ? 1 : 0);
-			expect(await env.db("data").count({ n: "*" }).first()).toEqual({
+			expect(await visibleData().count({ n: "*" }).first()).toEqual({
 				n: enabled ? 0 : 1,
 			});
-			expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
+			expect(
+				await visibleMemberships().count({ n: "*" }).first(),
+			).toEqual({
 				n: enabled ? 0 : 5,
 			});
 		},
@@ -216,10 +285,10 @@ describe.sequential("cleanup cached filesystem paths", () => {
 		await seed(["/synthetic/root/file"], 5);
 		fs.check = () => Promise.reject(missing());
 		await env.cleanupDB();
-		expect(await env.db("data").count({ n: "*" }).first()).toEqual({
+		expect(await visibleData().count({ n: "*" }).first()).toEqual({
 			n: 1,
 		});
-		expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
+		expect(await visibleMemberships().count({ n: "*" }).first()).toEqual({
 			n: 5,
 		});
 	});
@@ -238,10 +307,12 @@ describe.sequential("cleanup cached filesystem paths", () => {
 		try {
 			await env.cleanupDB();
 			expect(snatchHistory.has("expired-review-fixture")).toBe(false);
-			expect(await env.db("data").count({ n: "*" }).first()).toEqual({
+			expect(await visibleData().count({ n: "*" }).first()).toEqual({
 				n: 1,
 			});
-			expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
+			expect(
+				await visibleMemberships().count({ n: "*" }).first(),
+			).toEqual({
 				n: 5,
 			});
 		} finally {
@@ -264,8 +335,8 @@ describe.sequential("cleanup cached filesystem paths", () => {
 		};
 		await env.cleanupDB();
 		expect(rootCalls).toBe(3);
-		expect(await env.db("data")).toEqual([]);
-		expect(await env.db("ensemble")).toEqual([]);
+		expect(await visibleData()).toEqual([]);
+		expect(await visibleMemberships()).toEqual([]);
 	});
 
 	it("avoids root probes when all cached paths are accessible", async () => {
@@ -280,7 +351,7 @@ describe.sequential("cleanup cached filesystem paths", () => {
 		};
 		await env.cleanupDB();
 		expect(rootCalls).toBe(0);
-		expect(await env.db("data").count({ n: "*" }).first()).toEqual({
+		expect(await visibleData().count({ n: "*" }).first()).toEqual({
 			n: 1100,
 		});
 	});
@@ -298,10 +369,10 @@ describe.sequential("cleanup cached filesystem paths", () => {
 				? Promise.resolve()
 				: Promise.reject(missing());
 		await env.cleanupDB();
-		expect(await env.db("data").count({ n: "*" }).first()).toEqual({
+		expect(await visibleData().count({ n: "*" }).first()).toEqual({
 			n: 2,
 		});
-		expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
+		expect(await visibleMemberships().count({ n: "*" }).first()).toEqual({
 			n: 10,
 		});
 	});
@@ -327,10 +398,12 @@ describe.sequential("cleanup cached filesystem paths", () => {
 		};
 		try {
 			await env.cleanupDB();
-			expect(await env.db("data").count({ n: "*" }).first()).toEqual({
+			expect(await visibleData().count({ n: "*" }).first()).toEqual({
 				n: 88,
 			});
-			expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
+			expect(
+				await visibleMemberships().count({ n: "*" }).first(),
+			).toEqual({
 				n: 440,
 			});
 			expect(snatchHistory.has("later-outage-fixture")).toBe(false);
@@ -339,7 +412,7 @@ describe.sequential("cleanup cached filesystem paths", () => {
 		}
 	});
 
-	it("preserves null paths and uses SQLite ordering for unusual paths", async () => {
+	it("preserves null legacy paths and uses SQLite ordering for unusual visible paths", async () => {
 		const paths = [
 			null,
 			"",
@@ -364,10 +437,17 @@ describe.sequential("cleanup cached filesystem paths", () => {
 		expect(new Set(checked)).toEqual(
 			new Set(paths.filter((p) => p !== null)),
 		);
-		expect(await env.db("data").select("path")).toEqual([{ path: null }]);
-		expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
-			n: 5,
+		expect(await visibleData().select("path")).toEqual([{ path: null }]);
+		expect(await visibleMemberships().count({ n: "*" }).first()).toEqual({
+			n: 0,
 		});
+		expect(
+			await env
+				.db("ensemble")
+				.whereNull("path")
+				.count({ n: "*" })
+				.first(),
+		).toEqual({ n: 5 });
 	});
 
 	it("continues after watcher insertions and deletions without skipping cached pages", async () => {
@@ -385,6 +465,23 @@ describe.sequential("cleanup cached filesystem paths", () => {
 					"/synthetic/root/0000-before",
 					"/synthetic/root/zz-after",
 				]);
+				await publishPath("/synthetic/root/0000-before");
+				await publishPath("/synthetic/root/zz-after");
+				const removed = await env
+					.db<SourceOrigin>("source_origin")
+					.whereRaw("json_extract(metadata, '$.path') = ?", [
+						paths[600],
+					])
+					.first();
+				if (!removed) throw new Error("Fixture origin not present");
+				expect(
+					await tombstoneSourceOrigin(
+						env.db,
+						removed.id,
+						removed.revision,
+						removed.revision + 1,
+					),
+				).toBe(true);
 				await env.db("data").where("path", paths[600]).del();
 				await env.db("ensemble").where("path", paths[600]).del();
 			}
@@ -392,39 +489,72 @@ describe.sequential("cleanup cached filesystem paths", () => {
 		};
 		await env.cleanupDB();
 		// Inserts behind the captured page cursor are deliberately deferred.
-		expect(await env.db("data").select("path")).toEqual([
+		expect(await visibleData().select("path")).toEqual([
 			{ path: "/synthetic/root/0000-before" },
 		]);
 		await env.cleanupDB();
-		expect(await env.db("data")).toEqual([]);
-		expect(await env.db("ensemble")).toEqual([]);
+		expect(await visibleData()).toEqual([]);
+		expect(await visibleMemberships()).toEqual([]);
 	});
 
-	it("rolls back both table deletions when a delete fails and can restart", async () => {
+	it("rolls back origin visibility and revisions when an update fails and can restart", async () => {
 		await seed(["/synthetic/root/deleted"], 5);
 		fs.check = (path) =>
 			path === "/synthetic/root"
 				? Promise.resolve()
 				: Promise.reject(missing());
+		const originsBefore = await env
+			.db<SourceOrigin>("source_origin")
+			.select("id", "state", "revision", "metadata")
+			.orderBy("id");
 		await env.db.raw(
-			"CREATE TRIGGER cleanup_failure BEFORE DELETE ON ensemble BEGIN SELECT RAISE(ABORT, 'synthetic delete failure'); END",
+			"CREATE TRIGGER cleanup_failure BEFORE UPDATE ON source_origin BEGIN SELECT RAISE(ABORT, 'synthetic visibility failure'); END",
 		);
 		try {
 			await expect(env.cleanupDB()).rejects.toThrow(
-				"synthetic delete failure",
+				"synthetic visibility failure",
 			);
-			expect(await env.db("data").count({ n: "*" }).first()).toEqual({
+			expect(await visibleData().count({ n: "*" }).first()).toEqual({
 				n: 1,
 			});
-			expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
+			expect(
+				await visibleMemberships().count({ n: "*" }).first(),
+			).toEqual({
 				n: 5,
 			});
+			expect(
+				await env
+					.db<SourceOrigin>("source_origin")
+					.select("id", "state", "revision", "metadata")
+					.orderBy("id"),
+			).toEqual(originsBefore);
 		} finally {
 			await env.db.raw("DROP TRIGGER cleanup_failure");
 		}
 		await env.cleanupDB();
-		expect(await env.db("data")).toEqual([]);
-		expect(await env.db("ensemble")).toEqual([]);
+		expect(await visibleData()).toEqual([]);
+		expect(await visibleMemberships()).toEqual([]);
+		expect(await env.db("data").count({ n: "*" }).first()).toEqual({
+			n: 1,
+		});
+		expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
+			n: 5,
+		});
+		expect(
+			await env.db("ensemble_membership").count({ n: "*" }).first(),
+		).toEqual({ n: 5 });
+		expect(
+			await env
+				.db<SourceOrigin>("source_origin")
+				.select("id", "state", "revision", "metadata")
+				.orderBy("id"),
+		).toEqual(
+			originsBefore.map((origin) => ({
+				...origin,
+				state: "unavailable",
+				revision: origin.revision + 1,
+			})),
+		);
 	});
 
 	it("retains a newly moved path and removes its missing old memberships", async () => {
@@ -432,15 +562,42 @@ describe.sequential("cleanup cached filesystem paths", () => {
 		fs.check = async (path) => {
 			if (path !== "/synthetic/root/old") return;
 			await seed(["/synthetic/root/new"], 5);
+			await publishPath("/synthetic/root/new", 5);
 			throw missing();
 		};
 		await env.cleanupDB();
-		expect(await env.db("data").select("path")).toEqual([
+		expect(await visibleData().select("path")).toEqual([
 			{ path: "/synthetic/root/new" },
 		]);
-		expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
+		expect(await visibleMemberships().count({ n: "*" }).first()).toEqual({
 			n: 5,
 		});
+	});
+
+	it("retains a same-path watcher publication accepted during a missing-path probe", async () => {
+		await seed(["/synthetic/root/revised"], 5);
+		let published = false;
+		fs.check = async (path) => {
+			if (path === "/synthetic/root") return;
+			if (!published) {
+				published = true;
+				await publishPath(path, 5);
+			}
+			throw missing();
+		};
+		await env.cleanupDB();
+		expect(await visibleData().select("path")).toEqual([
+			{ path: "/synthetic/root/revised" },
+		]);
+		expect(await visibleMemberships().count({ n: "*" }).first()).toEqual({
+			n: 5,
+		});
+		expect(
+			await env
+				.db<SourceOrigin>("source_origin")
+				.select("state", "revision")
+				.first(),
+		).toEqual({ state: "verified", revision: 1 });
 	});
 
 	it.each([200_000, 1_000_000])(
@@ -457,6 +614,7 @@ describe.sequential("cleanup cached filesystem paths", () => {
 					[`alternate-${member}`],
 				);
 			}
+			await ownershipMigration.up(env.db);
 			let calls = 0;
 			fs.check = (path) => {
 				if (path === "/synthetic/root") return Promise.resolve();
@@ -468,12 +626,23 @@ describe.sequential("cleanup cached filesystem paths", () => {
 			await env.cleanupDB();
 			const remaining = paths - Math.ceil(paths / 17);
 			expect(calls).toBe(paths);
-			expect(await env.db("data").count({ n: "*" }).first()).toEqual({
+			expect(await visibleData().count({ n: "*" }).first()).toEqual({
 				n: remaining,
 			});
-			expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
+			expect(
+				await visibleMemberships().count({ n: "*" }).first(),
+			).toEqual({
 				n: remaining * 5,
 			});
+			expect(await env.db("data").count({ n: "*" }).first()).toEqual({
+				n: paths,
+			});
+			expect(await env.db("ensemble").count({ n: "*" }).first()).toEqual({
+				n: rows,
+			});
+			expect(
+				await env.db("ensemble_membership").count({ n: "*" }).first(),
+			).toEqual({ n: rows });
 			expect(await env.db.raw("PRAGMA integrity_check")).toEqual([
 				{ integrity_check: "ok" },
 			]);

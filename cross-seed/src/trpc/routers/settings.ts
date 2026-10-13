@@ -1,3 +1,4 @@
+import { reconcileSourceNamespaces } from "../../torrent.js";
 import { authedProcedure, router } from "../index.js";
 import { Label, logger } from "../../logger.js";
 import { getRuntimeConfig, setRuntimeConfig } from "../../runtimeConfig.js";
@@ -52,6 +53,7 @@ export const settingsRouter = router({
 
 				// Keep in-process torrent clients in sync with updated settings.
 				reloadDownloadClients();
+				await reconcileSourceNamespaces();
 
 				return { success: true };
 			} catch (error) {

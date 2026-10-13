@@ -33,6 +33,8 @@ const info = {
 	total_size: 100,
 	state: "downloading",
 };
+let responseGate: ((params: URLSearchParams) => Promise<void>) | undefined;
+let catalogExtras: (typeof info)[] = [];
 let present = true;
 let failFiles = false;
 let failInfo = false;
@@ -48,7 +50,12 @@ const server = createServer(async (req, res) => {
 	let body = "";
 	for await (const chunk of req) body += chunk;
 	const params = new URLSearchParams(body);
-	const route = req.url!.replace("/api/v2", "");
+	const endpoint = req.url!.startsWith("/first/")
+		? "first"
+		: req.url!.startsWith("/second/")
+			? "second"
+			: undefined;
+	const route = req.url!.replace(/^.*?\/api\/v2/, "");
 	requests.push({ route, hashes: params.get("hashes") });
 	if (authFailure) {
 		res.statusCode = route === "/auth/login" ? 401 : 403;
@@ -84,37 +91,48 @@ const server = createServer(async (req, res) => {
 		res.end("deleted");
 		return;
 	}
+
+	const torrentRows = [info, ...catalogExtras]
+		.filter(
+			(torrent) =>
+				!params.has("hashes") || params.get("hashes") === torrent.hash,
+		)
+		.map((torrent) => ({
+			...torrent,
+			...(identityKind === "legacy"
+				? { infohash_v1: undefined, infohash_v2: undefined }
+				: identityKind === "v2"
+					? { infohash_v1: "" }
+					: {}),
+			...(embedded
+				? {
+						files: [
+							{
+								name: endpoint
+									? `${endpoint}.mkv`
+									: "embedded.mkv",
+								size: 100,
+								index: 0,
+								progress: 1,
+								priority: 1,
+							},
+						],
+						trackers: endpoint
+							? [
+									{
+										url: `https://${endpoint}.invalid/announce`,
+										tier: 0,
+										status: 2,
+									},
+								]
+							: [],
+					}
+				: {}),
+		}));
 	const value =
 		route === "/torrents/info"
-			? present &&
-				(!params.has("hashes") || params.get("hashes") === hash)
-				? [
-						{
-							...info,
-							...(identityKind === "legacy"
-								? {
-										infohash_v1: undefined,
-										infohash_v2: undefined,
-									}
-								: identityKind === "v2"
-									? { infohash_v1: "" }
-									: {}),
-							...(embedded
-								? {
-										files: [
-											{
-												name: "embedded.mkv",
-												size: 100,
-												index: 0,
-												progress: 1,
-												priority: 1,
-											},
-										],
-										trackers: [],
-									}
-								: {}),
-						},
-					]
+			? present
+				? torrentRows
 				: []
 			: route === "/torrents/files"
 				? [
@@ -133,10 +151,14 @@ const server = createServer(async (req, res) => {
 							status: 2,
 						},
 					];
+
+	const payload = JSON.stringify(value);
+	if (route === "/torrents/info") await responseGate?.(params);
 	res.setHeader("content-type", "application/json");
-	res.end(JSON.stringify(value));
+	res.end(payload);
 });
 let client: InstanceType<typeof QBittorrent>;
+let fixtureOwner: string;
 beforeAll(async () => {
 	await db.migrate.latest();
 	await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -150,6 +172,9 @@ beforeAll(async () => {
 });
 beforeEach(async () => {
 	requests = [];
+	catalogExtras = [];
+	info.hash = hash;
+	responseGate = undefined;
 	present = true;
 	failFiles = false;
 	failInfo = false;
@@ -161,9 +186,18 @@ beforeEach(async () => {
 	failCatalog = false;
 	catalogDelay = 0;
 	info.state = "downloading";
+	const { ensureSourceNamespace } = await import("../src/sourceStore.js");
+	const address = server.address() as import("node:net").AddressInfo;
+	const owner = await ensureSourceNamespace(
+		db,
+		"client",
+		`http://127.0.0.1:${address.port}`,
+	);
+	fixtureOwner = owner;
 	await db<ClientSearcheeRow>("client_searchee").del();
 	await db<ClientSearcheeRow>("client_searchee").insert({
 		client_host: "fixture",
+		source_namespace_id: owner,
 		info_hash: hash,
 		name: "old",
 		title: "old",
@@ -192,6 +226,485 @@ afterAll(async () => {
 	await new Promise<void>((r) => server.close(() => r()));
 	await rm(config, { recursive: true, force: true });
 });
+function gate() {
+	let release!: () => void;
+	const pending = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	return { pending, release };
+}
+
+describe("qB request ordered publication", () => {
+	it("rehydrates identical shallow fields across endpoint A to B to A without borrowing file metadata", async () => {
+		const { restartClientCachePublication } =
+			await import("../src/clientCachePublication.js");
+		const address = server.address() as import("node:net").AddressInfo;
+		const base = `http://127.0.0.1:${address.port}`;
+		const firstUrl = `${base}/first`,
+			secondUrl = `${base}/second`;
+		embedded = true;
+		const first = new QBittorrent(firstUrl, "endpoint-cache", 0, true);
+		expect(
+			(await first.getClientSearchees()).searchees[0]?.files[0]?.name,
+		).toBe("first.mkv");
+		await db("source_namespace")
+			.where({ type: "client", locator: firstUrl })
+			.update({ enabled: 0 });
+		restartClientCachePublication();
+		const second = new QBittorrent(secondUrl, "endpoint-cache", 0, true);
+		const changed = await second.getClientSearchees();
+		expect(changed.newSearchees[0]?.files[0]?.name).toBe("second.mkv");
+		expect(changed.newSearchees[0]?.trackers).toEqual(["second.invalid"]);
+		await db("source_namespace")
+			.where({ type: "client", locator: secondUrl })
+			.update({ enabled: 0 });
+		await db("source_namespace")
+			.where({ type: "client", locator: firstUrl })
+			.update({ enabled: 1 });
+		restartClientCachePublication();
+		const rebound = new QBittorrent(firstUrl, "endpoint-cache", 0, true);
+		const returned = await rebound.getClientSearchees();
+		expect(returned.newSearchees[0]?.files[0]?.name).toBe("first.mkv");
+		expect(returned.newSearchees[0]?.trackers).toEqual(["first.invalid"]);
+		const row = await db<ClientSearcheeRow>("client_searchee")
+			.where({ client_host: "endpoint-cache", info_hash: hash })
+			.first();
+		expect(
+			(
+				await db<{ locator: string }>("source_namespace")
+					.where("id", row!.source_namespace_id!)
+					.first()
+			)?.locator,
+		).toBe(firstUrl);
+		expect(
+			await db("source_namespace")
+				.where({ locator: secondUrl, enabled: 0 })
+				.first(),
+		).toBeDefined();
+	});
+
+	it("retries an unchanged cache-hit catalog superseded after actual cache hydration", async () => {
+		embedded = true;
+		info.save_path = "/fixture/cache-old";
+		await client.refreshOne(hash);
+		const cache = await import("../src/clients/clientCache.js");
+		const original = cache.cachedClientTorrents;
+		const entered = gate(),
+			held = gate();
+		let blocked = false;
+		const observer = vi
+			.spyOn(cache, "cachedClientTorrents")
+			.mockImplementation(async function* (...args) {
+				for await (const entry of original(...args)) {
+					yield entry;
+					if (entry.useCache && !blocked) {
+						blocked = true;
+						entered.release();
+						await held.pending;
+					}
+				}
+			});
+		try {
+			const old = client.getClientSearchees();
+			await entered.pending;
+			info.save_path = "/fixture/cache-new";
+			await client.refreshOne(hash);
+			held.release();
+			expect((await old).searchees[0]?.savePath).toBe(
+				"/fixture/cache-new",
+			);
+		} finally {
+			held.release();
+			observer.mockRestore();
+		}
+	});
+
+	it("does not relabel a shared old empty catalog as a later scoped not-found result", async () => {
+		const canonical = "3".repeat(40);
+		const secondAlias = "4".repeat(64);
+		const second = {
+			...info,
+			hash: canonical,
+			infohash_v1: canonical,
+			infohash_v2: secondAlias,
+		};
+		catalogExtras = [second];
+		embedded = true;
+		present = false;
+		const entered = gate(),
+			held = gate(),
+			joined = gate();
+		let blocked = false;
+		responseGate = async (params) => {
+			if (!params.has("hashes") && !blocked) {
+				blocked = true;
+				entered.release();
+				await held.pending;
+			}
+		};
+		const transport = client as unknown as {
+			metadataRequest: (
+				route: string,
+				params: URLSearchParams,
+			) => Promise<unknown>;
+		};
+		const original = transport.metadataRequest.bind(
+			client,
+		) as typeof transport.metadataRequest;
+		const observer = vi
+			.spyOn(transport, "metadataRequest")
+			.mockImplementation(async (route, params) => {
+				const value = await original(route, params);
+				if (
+					params.get("hashes") === secondAlias &&
+					Array.isArray(value) &&
+					!value.length
+				)
+					queueMicrotask(() =>
+						queueMicrotask(() => joined.release()),
+					);
+				return value;
+			});
+		try {
+			const first = client.refreshOne(alias);
+			await entered.pending;
+			present = true;
+			info.save_path = "/fixture/appeared";
+			second.save_path = info.save_path;
+			await client.refreshOne(canonical);
+			const later = client.refreshOne(secondAlias);
+			await joined.pending;
+			held.release();
+			expect((await later)?.savePath).toBe("/fixture/appeared");
+			// The unrelated first source has no newer accepted publication; its
+			// earlier negative observation remains valid under the read-order contract.
+			expect(await first).toBeUndefined();
+		} finally {
+			held.release();
+			observer.mockRestore();
+		}
+	});
+
+	it("never publishes a shared older embedded alias catalog under a later consumer lease", async () => {
+		const canonical = "3".repeat(40);
+		const secondAlias = "4".repeat(64);
+		const second = {
+			...info,
+			hash: canonical,
+			infohash_v1: canonical,
+			infohash_v2: secondAlias,
+		};
+		catalogExtras = [second];
+		embedded = true;
+		info.save_path = "/fixture/shared-old";
+		second.save_path = info.save_path;
+		const entered = gate(),
+			held = gate(),
+			joined = gate();
+		let blocked = false;
+		responseGate = async (params) => {
+			if (!params.has("hashes") && !blocked) {
+				blocked = true;
+				entered.release();
+				await held.pending;
+			}
+		};
+		const transport = client as unknown as {
+			metadataRequest: (
+				route: string,
+				params: URLSearchParams,
+			) => Promise<unknown>;
+		};
+		const original = transport.metadataRequest.bind(
+			client,
+		) as typeof transport.metadataRequest;
+		const observer = vi
+			.spyOn(transport, "metadataRequest")
+			.mockImplementation(async (route, params) => {
+				const value = await original(route, params);
+				if (
+					params.get("hashes") === secondAlias &&
+					Array.isArray(value) &&
+					!value.length
+				) {
+					// Let the real caller consume its targeted miss and join the held catalog
+					// before releasing that response. No RPC data is replaced by this observer.
+					queueMicrotask(() =>
+						queueMicrotask(() => joined.release()),
+					);
+				}
+				return value;
+			});
+		try {
+			const first = client.refreshOne(alias);
+			await entered.pending;
+			info.save_path = "/fixture/shared-new";
+			second.save_path = info.save_path;
+			expect((await client.refreshOne(canonical))?.savePath).toBe(
+				"/fixture/shared-new",
+			);
+			const later = client.refreshOne(secondAlias);
+			await joined.pending;
+			held.release();
+			expect((await later)?.savePath).toBe("/fixture/shared-new");
+			expect((await first)?.savePath).toBe("/fixture/shared-new");
+			expect(
+				requests.filter(
+					(request) =>
+						request.route === "/torrents/info" &&
+						request.hashes === null,
+				),
+			).toHaveLength(1);
+		} finally {
+			held.release();
+			observer.mockRestore();
+		}
+	});
+
+	it("rejects retrying a retained old client instance after an endpoint rebind", async () => {
+		const { restartClientCachePublication } =
+			await import("../src/clientCachePublication.js");
+		const address = server.address() as import("node:net").AddressInfo;
+		const oldClient = new QBittorrent(
+			`http://127.0.0.1:${address.port}`,
+			"retained-client",
+			0,
+			true,
+		);
+		const entered = gate(),
+			held = gate();
+		let blocked = false;
+		responseGate = async (params) => {
+			if (params.has("hashes") && !blocked) {
+				blocked = true;
+				entered.release();
+				await held.pending;
+			}
+		};
+		const pending = oldClient.refreshOne(hash);
+		const rejected = expect(pending).rejects.toThrow(
+			"configuration changed",
+		);
+		await entered.pending;
+		restartClientCachePublication();
+		new QBittorrent(
+			"https://replacement.invalid/rpc",
+			"retained-client",
+			0,
+			true,
+		);
+		held.release();
+		await rejected;
+		expect(
+			await db("client_searchee").where("client_host", "retained-client"),
+		).toHaveLength(0);
+	});
+
+	it("reconciles a successfully validated empty complete inventory", async () => {
+		present = false;
+		expect(await client.getClientSearchees({ refresh: [] })).toEqual({
+			searchees: [],
+			newSearchees: [],
+		});
+		expect(
+			await db("client_searchee").where("client_host", "fixture"),
+		).toHaveLength(0);
+		expect(
+			await db("client_searchee").where("client_host", "other"),
+		).toHaveLength(1);
+	});
+
+	it("retries complete catalogs changed remotely during separate detail hydration", async () => {
+		info.save_path = "/fixture/full-old";
+		let changed = false;
+		responseGate = (params) => {
+			if (!params.has("hashes") && !changed) {
+				changed = true;
+				info.save_path = "/fixture/full-new";
+			}
+			return Promise.resolve();
+		};
+		const result = await client.getClientSearchees({ refresh: [] });
+		expect(result.newSearchees[0]?.savePath).toBe("/fixture/full-new");
+		expect(
+			(
+				await db<ClientSearcheeRow>("client_searchee")
+					.where({ client_host: "fixture", info_hash: hash })
+					.first()
+			)?.save_path,
+		).toBe("/fixture/full-new");
+	});
+	it("preserves cache and absent sources when full catalog fingerprints never stabilize", async () => {
+		await db("client_searchee").insert({
+			client_host: "fixture",
+			info_hash: "absent",
+			name: "preserve",
+			files: "[]",
+		});
+		let catalogs = 0;
+		responseGate = (params) => {
+			if (!params.has("hashes"))
+				info.save_path = `/fixture/drift-${++catalogs}`;
+			return Promise.resolve();
+		};
+		await expect(
+			client.getClientSearchees({ refresh: [] }),
+		).rejects.toThrow("concurrency retries exhausted");
+		expect(catalogs).toBe(3);
+		expect(
+			(
+				await db<ClientSearcheeRow>("client_searchee")
+					.where({ client_host: "fixture", info_hash: hash })
+					.first()
+			)?.save_path,
+		).toBe("/old");
+		expect(
+			await db("client_searchee")
+				.where({ client_host: "fixture", info_hash: "absent" })
+				.first(),
+		).toBeDefined();
+	});
+	it("uses one embedded complete catalog without redundant fingerprint RPCs", async () => {
+		embedded = true;
+		await client.getClientSearchees({
+			refresh: [],
+			includeFiles: true,
+			includeTrackers: true,
+		});
+		expect(
+			requests.filter((request) => request.route === "/torrents/info"),
+		).toHaveLength(1);
+	});
+
+	it("revalidates placement changed remotely between info and separate detail requests", async () => {
+		info.save_path = "/fixture/remote-old";
+		let moved = false;
+		responseGate = (params) => {
+			if (params.has("hashes") && !moved) {
+				moved = true;
+				info.save_path = "/fixture/remote-new";
+			}
+			return Promise.resolve();
+		};
+		expect((await client.refreshOne(hash))?.savePath).toBe(
+			"/fixture/remote-new",
+		);
+	});
+
+	it("retries a superseded absent scoped response instead of reporting not found", async () => {
+		present = false;
+		let changed = false;
+		responseGate = async (params) => {
+			if (
+				!params.has("hashes") &&
+				!params.has("includeFiles") &&
+				!changed
+			) {
+				changed = true;
+				present = true;
+				await client.getClientSearchees({
+					refresh: [],
+					includeFiles: true,
+					includeTrackers: true,
+				});
+			}
+		};
+		expect((await client.refreshOne(hash))?.infoHash).toBe(hash);
+	});
+
+	it("reports concurrency after bounded scoped retries lose to newer HTTP snapshots", async () => {
+		embedded = true;
+		let scopes = 0;
+		responseGate = async (params) => {
+			if (params.has("hashes")) {
+				scopes++;
+				await client.getClientSearchees({
+					refresh: [],
+					includeFiles: true,
+					includeTrackers: true,
+				});
+			}
+		};
+		await expect(client.refreshOne(hash)).rejects.toThrow(
+			"concurrency retries exhausted",
+		);
+		expect(scopes).toBe(3);
+	});
+
+	it("preserves absent cached sources when complete detail hydration fails", async () => {
+		await db("client_searchee").insert({
+			client_host: "fixture",
+			info_hash: "absent",
+			name: "preserve",
+			files: "[]",
+		});
+		failFiles = true;
+		await expect(
+			client.getClientSearchees({ refresh: [] }),
+		).rejects.toThrow("incomplete");
+		expect(
+			await db<ClientSearcheeRow>("client_searchee")
+				.where({ client_host: "fixture", info_hash: "absent" })
+				.first(),
+		).toBeDefined();
+	});
+
+	it("keeps the scoped move when an older complete HTTP snapshot finishes last", async () => {
+		const entered = gate(),
+			held = gate();
+		info.save_path = "/fixture/old";
+		responseGate = async (params) => {
+			if (!params.has("hashes")) {
+				entered.release();
+				await held.pending;
+			}
+		};
+		const full = client.getClientSearchees({
+			refresh: [],
+			includeFiles: true,
+			includeTrackers: true,
+		});
+		await entered.pending;
+		info.save_path = "/fixture/new";
+		await client.refreshOne(hash);
+		held.release();
+		await full;
+		expect(
+			(await db<ClientSearcheeRow>("client_searchee")
+				.where({ client_host: "fixture", info_hash: hash })
+				.first())!.save_path,
+		).toBe("/fixture/new");
+	});
+	it("retries an older scoped HTTP response after a newer complete snapshot commits", async () => {
+		const entered = gate(),
+			held = gate();
+		info.save_path = "/fixture/old";
+		let blocked = false;
+		responseGate = async (params) => {
+			if (params.has("hashes") && !blocked) {
+				blocked = true;
+				entered.release();
+				await held.pending;
+			}
+		};
+		const scoped = client.refreshOne(hash);
+		await entered.pending;
+		info.save_path = "/fixture/new";
+		await client.getClientSearchees({
+			refresh: [],
+			includeFiles: true,
+			includeTrackers: true,
+		});
+		held.release();
+		expect((await scoped)?.savePath).toBe("/fixture/new");
+		expect(
+			(await db<ClientSearcheeRow>("client_searchee")
+				.where({ client_host: "fixture", info_hash: hash })
+				.first())!.save_path,
+		).toBe("/fixture/new");
+	});
+});
+
 describe("qB scoped refresh", () => {
 	it("refreshes legacy primary-only hashes without a catalog fallback", async () => {
 		identityKind = "legacy";
@@ -208,7 +721,7 @@ describe("qB scoped refresh", () => {
 		identityKind = "v2";
 		expect((await client.refreshOne(alias))?.infoHash).toBe(hash);
 		expect(
-			await db("client_searchee")
+			await db<ClientSearcheeRow>("client_searchee")
 				.where("client_host", "fixture")
 				.select("info_hash"),
 		).toEqual([{ info_hash: hash }]);
@@ -267,6 +780,18 @@ describe("qB scoped refresh", () => {
 				.filter((r) => r.route === "/torrents/info")
 				.every((r) => r.hashes === hash),
 		).toBe(true);
+	});
+	it("binds authoritative hybrid aliases to a single source origin", async () => {
+		await client.refreshOne(alias);
+		const bound = await db<{ origin_id: string; alias: string }>(
+			"source_alias",
+		)
+			.where("namespace_id", fixtureOwner)
+			.whereIn("alias", [hash, alias])
+			.select("origin_id", "alias");
+		expect(bound.some((row) => row.alias === hash)).toBe(true);
+		expect(bound.some((row) => row.alias === alias)).toBe(true);
+		expect(new Set(bound.map((row) => row.origin_id)).size).toBe(1);
 	});
 	it("resolves hybrid aliases with one bounded catalog fallback", async () => {
 		expect((await client.refreshOne(alias.toUpperCase()))?.infoHash).toBe(
@@ -340,7 +865,7 @@ describe("qB scoped refresh", () => {
 		expect((await client.refreshOne(hash))?.infoHash).toBe(hash);
 		expect(
 			requests.filter((r) => r.route === "/torrents/info"),
-		).toHaveLength(2);
+		).toHaveLength(3);
 	});
 	it("rejects exhausted authentication failure and preserves cached metadata", async () => {
 		authFailure = true;

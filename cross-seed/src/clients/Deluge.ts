@@ -1,3 +1,12 @@
+import {
+	bindClientSourceLocator,
+	normalizeSourceLocator,
+} from "../sourceStore.js";
+import {
+	beginClientCacheOperation,
+	ClientCacheConcurrencyError,
+	releaseClientCacheOperation,
+} from "../clientCachePublication.js";
 import { cachedClientTorrents } from "./clientCache.js";
 import { humanReadableSize } from "@cross-seed/shared/utils";
 import { readdir } from "fs/promises";
@@ -102,12 +111,16 @@ export default class Deluge implements TorrentClient {
 	private isLabelEnabled: boolean;
 	private delugeRequestId: number = 0;
 
+	private readonly sourceLocator: string;
+
 	constructor(
 		url: string,
 		clientHost: string,
 		priority: number,
 		readonly: boolean,
 	) {
+		this.sourceLocator = normalizeSourceLocator("client", url);
+		bindClientSourceLocator(clientHost, url);
 		this.url = url;
 		this.clientHost = clientHost;
 		this.clientPriority = priority;
@@ -800,106 +813,127 @@ export default class Deluge implements TorrentClient {
 		newSearcheesOnly?: boolean;
 		refresh?: string[];
 	}): Promise<ClientSearcheeResult> {
-		const searchees: SearcheeClient[] = [];
-		const newSearchees: SearcheeClient[] = [];
-		const infoHashes = new Set<string>();
-		const params: UpdateUiParams = [
-			["name", "label", "save_path", "total_size", "files", "trackers"],
-			{},
-		];
-		const torrentsRes = await this.call("web.update_ui", params);
-		if (torrentsRes.isErr()) {
-			logger.error({
-				label: this.label,
-				message: "Failed to get torrents from client",
-			});
-			logger.debug(torrentsRes.unwrapErr());
-			return { searchees, newSearchees };
-		}
-		const torrents = torrentsRes.unwrap().torrents;
-		if (!torrents || !Object.keys(torrents).length) {
-			logger.verbose({
-				label: this.label,
-				message: "No torrents found in client",
-			});
-			return { searchees, newSearchees };
-		}
-		for await (const {
-			torrent: entry,
-			infoHash,
-			useCache,
-			dbTorrent,
-		} of cachedClientTorrents(
-			Object.entries(torrents),
-			this.clientHost,
-			([hash]) => hash.toLowerCase(),
-			([, torrent], dbTorrent, infoHash) => {
+		const lease = beginClientCacheOperation(this.clientHost);
+		try {
+			if (lease.sourceLocator !== this.sourceLocator)
+				throw new Error("Client configuration changed during refresh");
+			let metadataComplete = true;
+			const searchees: SearcheeClient[] = [];
+			const newSearchees: SearcheeClient[] = [];
+			const infoHashes = new Set<string>();
+			const params: UpdateUiParams = [
+				[
+					"name",
+					"label",
+					"save_path",
+					"total_size",
+					"files",
+					"trackers",
+				],
+				{},
+			];
+			const torrentsRes = await this.call("web.update_ui", params);
+			if (torrentsRes.isErr()) {
+				logger.error({
+					label: this.label,
+					message: "Failed to get torrents from client",
+				});
+				logger.debug(torrentsRes.unwrapErr());
+				throw new Error("Client catalog metadata hydration incomplete");
+			}
+			const torrents = torrentsRes.unwrap().torrents;
+			if (!torrents)
+				throw new Error("Client catalog metadata hydration incomplete");
+			for await (const {
+				torrent: entry,
+				infoHash,
+				useCache,
+				dbTorrent,
+			} of cachedClientTorrents(
+				Object.entries(torrents),
+				this.clientHost,
+				([hash]) => hash.toLowerCase(),
+				([, torrent], dbTorrent, infoHash) => {
+					const name = torrent.name!;
+					const savePath = torrent.save_path!;
+					const category = torrent.label ?? "";
+					const modified = clientSearcheeModified(
+						this.label,
+						dbTorrent,
+						name,
+						savePath,
+						{
+							category,
+						},
+					);
+					const refresh =
+						options?.refresh === undefined
+							? false
+							: options.refresh.length === 0
+								? true
+								: options.refresh.includes(infoHash);
+
+					return !modified && !refresh;
+				},
+				!options?.newSearcheesOnly && options?.refresh?.length !== 0,
+				lease.sourceLocator,
+			)) {
+				const [, torrent] = entry;
+				infoHashes.add(infoHash);
+				if (useCache) {
+					if (!options?.newSearcheesOnly) {
+						searchees.push(createSearcheeFromDB(dbTorrent!));
+					}
+					continue;
+				}
+
 				const name = torrent.name!;
 				const savePath = torrent.save_path!;
 				const category = torrent.label ?? "";
-				const modified = clientSearcheeModified(
-					this.label,
-					dbTorrent,
-					name,
-					savePath,
-					{
-						category,
-					},
-				);
-				const refresh =
-					options?.refresh === undefined
-						? false
-						: options.refresh.length === 0
-							? true
-							: options.refresh.includes(infoHash);
-
-				return !modified && !refresh;
-			},
-			!options?.newSearcheesOnly && options?.refresh?.length !== 0,
-		)) {
-			const [, torrent] = entry;
-			infoHashes.add(infoHash);
-			if (useCache) {
-				if (!options?.newSearcheesOnly) {
-					searchees.push(createSearcheeFromDB(dbTorrent!));
+				const files = torrent.files!.map((file) => ({
+					name: basename(file.path),
+					path: file.path,
+					length: file.size,
+				}));
+				if (!files.length) {
+					logger.verbose({
+						label: this.label,
+						message: `No files found for ${torrent.name} [${sanitizeInfoHash(infoHash)}]: skipping`,
+					});
+					metadataComplete = false;
+					continue;
 				}
-				continue;
+				const trackers = organizeTrackers(torrent.trackers!);
+				const title = parseTitle(name, files) ?? name;
+				const length = torrent.total_size!;
+				const searchee: SearcheeClient = {
+					infoHash,
+					name,
+					title,
+					files,
+					length,
+					clientHost: this.clientHost,
+					savePath,
+					category,
+					trackers,
+				};
+				newSearchees.push(searchee);
+				searchees.push(searchee);
 			}
-
-			const name = torrent.name!;
-			const savePath = torrent.save_path!;
-			const category = torrent.label ?? "";
-			const files = torrent.files!.map((file) => ({
-				name: basename(file.path),
-				path: file.path,
-				length: file.size,
-			}));
-			if (!files.length) {
-				logger.verbose({
-					label: this.label,
-					message: `No files found for ${torrent.name} [${sanitizeInfoHash(infoHash)}]: skipping`,
-				});
-				continue;
-			}
-			const trackers = organizeTrackers(torrent.trackers!);
-			const title = parseTitle(name, files) ?? name;
-			const length = torrent.total_size!;
-			const searchee: SearcheeClient = {
-				infoHash,
-				name,
-				title,
-				files,
-				length,
-				clientHost: this.clientHost,
-				savePath,
-				category,
-				trackers,
-			};
-			newSearchees.push(searchee);
-			searchees.push(searchee);
+			const accepted = await updateSearcheeClientDB(
+				this.clientHost,
+				newSearchees,
+				infoHashes,
+				lease,
+				metadataComplete,
+			);
+			if (!accepted) throw new ClientCacheConcurrencyError();
+			if (!metadataComplete)
+				throw new Error("Client catalog metadata hydration incomplete");
+			return { searchees, newSearchees };
+		} finally {
+			releaseClientCacheOperation(lease);
 		}
-		await updateSearcheeClientDB(this.clientHost, newSearchees, infoHashes);
-		return { searchees, newSearchees };
 	}
 
 	private isComplete(t: TorrentInfo): boolean {

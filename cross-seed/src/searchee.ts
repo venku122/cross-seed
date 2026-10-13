@@ -1,4 +1,11 @@
-import { invalidateHealth } from "./healthGeneration.js";
+import { setImmediate } from "node:timers/promises";
+import {
+	beginClientCacheOperation,
+	releaseClientCacheOperation,
+	completeClientCacheSnapshot,
+	publishClientCacheBatch,
+	type ClientCacheLease,
+} from "./clientCachePublication.js";
 import { readdir, stat } from "fs/promises";
 import { basename, dirname, isAbsolute, join, relative } from "path";
 import ms from "ms";
@@ -35,7 +42,14 @@ import { Label, logger } from "./logger.js";
 import { Metafile } from "./parseTorrent.js";
 import { Result, resultOf, resultOfErr } from "./Result.js";
 import { getRuntimeConfig } from "./runtimeConfig.js";
-import { parseTorrentWithMetadata } from "./torrent.js";
+import {
+	normalizeSourceLocator,
+	ensureSourceNamespace,
+	resolveSourceOrigin,
+	replaceSourcePublication,
+	tombstoneSourceOrigin,
+} from "./sourceStore.js";
+import { createEnsemblePieces, parseTorrentWithMetadata } from "./torrent.js";
 import {
 	comparing,
 	createKeyTitle,
@@ -72,6 +86,11 @@ export type SearcheeLabel =
 	| Label.WEBHOOK;
 
 export interface Searchee {
+	/** Runtime provenance captured before source scanning; used for conditional publication. */
+	sourceRevision?: number;
+	sourceOriginId?: string;
+	/** Torrent-file provenance; never the media path used by linking. */
+	torrentFilePath?: string;
 	/**
 	 * If searchee is torrent based, !infoHash && !path for virtual
 	 */
@@ -385,54 +404,360 @@ export async function updateSearcheeClientDB(
 	clientHost: string,
 	newSearchees: SearcheeClient[],
 	infoHashes: Set<string>,
-): Promise<void> {
-	const removedInfoHashes = (
-		await db<{ info_hash: string }>("client_searchee")
-			.where("client_host", clientHost)
-			.select("info_hash")
-	)
-		.map((t) => t.info_hash)
-		.filter((infoHash) => !infoHashes.has(infoHash));
-	await inBatches(removedInfoHashes, async (batch) => {
-		await db("client_searchee")
-			.whereIn("info_hash", batch)
-			.where("client_host", clientHost)
-			.del();
-		await db("ensemble")
-			.whereIn("info_hash", batch)
-			.where("client_host", clientHost)
-			.del();
-	});
-	await upsertSearcheeClientDB(newSearchees);
-	if (removedInfoHashes.length) invalidateHealth();
+	lease?: ClientCacheLease,
+	complete = true,
+	aliases?: ReadonlyMap<string, readonly string[]>,
+): Promise<boolean> {
+	const operation = lease ?? beginClientCacheOperation(clientHost);
+	try {
+		if (operation.clientHost !== clientHost)
+			throw new Error("Client cache lease namespace mismatch");
+		// A failed metadata batch must never authorize removal of absent sources.
+		const accepted = await upsertSearcheeClientDB(
+			newSearchees,
+			operation,
+			aliases,
+		);
+		if (!complete) return accepted;
+		const completed = await completeClientCacheSnapshot(
+			operation,
+			async (trx, canRemove) => {
+				const locator = normalizeSourceLocator(
+					"client",
+					operation.sourceLocator,
+				);
+				const seenOrigins = new Set<string>();
+				const seenKeys = new Set(infoHashes);
+				await inBatches([...infoHashes], async (batch) => {
+					const keys = [
+						...new Set(
+							batch.flatMap((hash) => [
+								hash,
+								...(aliases?.get(hash) ?? []),
+							]),
+						),
+					];
+					for (const key of keys) {
+						seenKeys.add(key);
+						canRemove(key);
+					}
+					const known = await trx("source_alias as seen")
+						.join(
+							"source_namespace as namespace",
+							"seen.namespace_id",
+							"namespace.id",
+						)
+						.join(
+							"source_alias as known",
+							"seen.origin_id",
+							"known.origin_id",
+						)
+						.where({
+							"namespace.type": "client",
+							"namespace.locator": locator,
+						})
+						.whereIn("seen.alias", keys)
+						.select<{ origin_id: string; alias: string }[]>(
+							"known.origin_id",
+							"known.alias",
+						);
+					for (const row of known) {
+						seenOrigins.add(row.origin_id);
+						seenKeys.add(row.alias);
+						canRemove(row.alias);
+					}
+				});
+				const namespaceRow = await trx<{
+					id: string;
+					type: string;
+					locator: string;
+				}>("source_namespace")
+					.where({ type: "client", locator })
+					.first();
+				const namespace = namespaceRow?.id;
+				const rows = await trx<{
+					info_hash: string;
+					source_namespace_id: string | null;
+				}>("client_searchee")
+					.where("client_host", clientHost)
+					.select("info_hash", "source_namespace_id");
+				const otherOwned = new Set(
+					rows
+						.filter(
+							(row) =>
+								row.source_namespace_id !== null &&
+								row.source_namespace_id !== namespace,
+						)
+						.map((row) => row.info_hash),
+				);
+				const removed = new Set(
+					rows
+						.filter(
+							(row) =>
+								!otherOwned.has(row.info_hash) &&
+								!seenKeys.has(row.info_hash) &&
+								canRemove(row.info_hash),
+						)
+						.map((row) => row.info_hash),
+				);
+				// A first validated inventory also reconciles named migrated sources.
+				// Unknown hosts and rows owned by another endpoint retain their provenance.
+				const legacy = await trx("source_origin")
+					.where({
+						namespace_id: "legacy-unknown",
+						state: "legacy-unknown",
+					})
+					.whereRaw(
+						"json_extract(metadata, '$.clientHost') = ? AND json_type(metadata, '$.infoHash') = 'text'",
+						[clientHost],
+					)
+					.select<
+						{ id: string; revision: number; info_hash: string }[]
+					>(
+						"id",
+						"revision",
+						trx.raw(
+							"json_extract(metadata, '$.infoHash') AS info_hash",
+						),
+					);
+				for (const origin of legacy) {
+					if (
+						!origin.info_hash ||
+						otherOwned.has(origin.info_hash) ||
+						seenKeys.has(origin.info_hash) ||
+						!canRemove(origin.info_hash)
+					)
+						continue;
+					if (
+						!(await tombstoneSourceOrigin(
+							trx,
+							origin.id,
+							origin.revision,
+							origin.revision + 1,
+						))
+					)
+						throw new Error(
+							"Client source removal revision conflict",
+						);
+					removed.add(origin.info_hash);
+				}
+				if (namespace) {
+					await inBatches([...removed], async (batch) => {
+						const origins = await trx("source_alias as alias")
+							.join(
+								"source_origin as origin",
+								"alias.origin_id",
+								"origin.id",
+							)
+							.where("alias.namespace_id", namespace)
+							.whereIn("alias.alias", batch)
+							.distinct<
+								{ id: string; revision: number }[]
+							>("origin.id", "origin.revision");
+						for (const origin of origins) {
+							if (
+								!seenOrigins.has(origin.id) &&
+								!(await tombstoneSourceOrigin(
+									trx,
+									origin.id,
+									origin.revision,
+									origin.revision + 1,
+								))
+							)
+								throw new Error(
+									"Client source removal revision conflict",
+								);
+						}
+					});
+				}
+				const removedHashes = [...removed];
+				// Complete removals share one transaction: metadata cannot disappear while
+				// its membership deletion fails, even at a later SQL batch.
+				await inBatches(removedHashes, async (batch) => {
+					await trx("client_searchee")
+						.whereIn("info_hash", batch)
+						.where("client_host", clientHost)
+						.del();
+					await trx("ensemble")
+						.whereIn("info_hash", batch)
+						.where("client_host", clientHost)
+						.del();
+				});
+				return removedHashes;
+			},
+		);
+		return accepted && completed;
+	} finally {
+		if (!lease) releaseClientCacheOperation(operation);
+	}
 }
 
 /** Update scoped metadata without reconciling a complete client snapshot. */
 export async function upsertSearcheeClientDB(
 	newSearchees: SearcheeClient[],
-): Promise<void> {
-	await inBatches(newSearchees, async (batch) => {
-		const rows = batch.map((searchee) => ({
-			info_hash: searchee.infoHash,
-			name: searchee.name,
-			title: searchee.title,
-			files: JSON.stringify(searchee.files),
-			length: searchee.length,
-			client_host: searchee.clientHost,
-			save_path: searchee.savePath,
-			category: searchee.category ?? null,
-			tags: searchee.tags ? JSON.stringify(searchee.tags) : null,
-			trackers: JSON.stringify(searchee.trackers),
-		}));
-		await db("client_searchee")
-			.insert(rows)
-			.onConflict(["client_host", "info_hash"])
-			.merge();
-	});
-	if (newSearchees.length) invalidateHealth();
+	lease?: ClientCacheLease,
+	aliases?: ReadonlyMap<string, readonly string[]>,
+): Promise<boolean> {
+	const leases = new Map<string, ClientCacheLease>();
+	for (const searchee of newSearchees) {
+		if (lease && lease.clientHost !== searchee.clientHost)
+			throw new Error("Client cache lease namespace mismatch");
+		if (!leases.has(searchee.clientHost))
+			leases.set(
+				searchee.clientHost,
+				lease ?? beginClientCacheOperation(searchee.clientHost),
+			);
+	}
+	try {
+		let accepted = true;
+		for (const [host, operation] of leases) {
+			await inBatches(
+				newSearchees.filter((s) => s.clientHost === host),
+				async (batch) => {
+					// Bind ordering to persisted origin equivalence even when an older client
+					// omits v1/v2 fields after a coordinator restart.
+					const knownAliases = new Map<string, string[]>(
+						batch.map((source) => [
+							source.infoHash,
+							[
+								source.infoHash,
+								...(aliases?.get(source.infoHash) ?? []),
+							],
+						]),
+					);
+					const keys = [
+						...new Set([...knownAliases.values()].flat()),
+					];
+					const bound = await db("source_alias as requested")
+						.join(
+							"source_namespace as namespace",
+							"requested.namespace_id",
+							"namespace.id",
+						)
+						.join(
+							"source_alias as known",
+							"requested.origin_id",
+							"known.origin_id",
+						)
+						.where({
+							"namespace.type": "client",
+							"namespace.locator": normalizeSourceLocator(
+								"client",
+								operation.sourceLocator,
+							),
+						})
+						.whereIn("requested.alias", keys)
+						.select<{ requested: string; alias: string }[]>(
+							"requested.alias as requested",
+							"known.alias as alias",
+						);
+					for (const [key, group] of knownAliases) {
+						knownAliases.set(key, [
+							...new Set([
+								...group,
+								...bound
+									.filter((row) =>
+										group.includes(row.requested),
+									)
+									.map((row) => row.alias),
+							]),
+						]);
+					}
+					const published = await publishClientCacheBatch(
+						operation,
+						batch.map((s) => s.infoHash),
+						async (trx, keys) => {
+							const namespace = await ensureSourceNamespace(
+								trx,
+								"client",
+								operation.sourceLocator,
+							);
+							const rows = batch
+								.filter((s) => keys.has(s.infoHash))
+								.map((searchee) => ({
+									info_hash: searchee.infoHash,
+									name: searchee.name,
+									title: searchee.title,
+									files: JSON.stringify(searchee.files),
+									length: searchee.length,
+									client_host: searchee.clientHost,
+									source_namespace_id: namespace,
+									save_path: searchee.savePath,
+									category: searchee.category ?? null,
+									tags: searchee.tags
+										? JSON.stringify(searchee.tags)
+										: null,
+									trackers: JSON.stringify(searchee.trackers),
+								}));
+							await trx("client_searchee")
+								.insert(rows)
+								.onConflict(["client_host", "info_hash"])
+								.merge();
+							for (const searchee of batch.filter((source) =>
+								keys.has(source.infoHash),
+							)) {
+								const origin = await resolveSourceOrigin(
+									trx,
+									namespace,
+									searchee.infoHash,
+									[
+										...(aliases?.get(searchee.infoHash) ??
+											[]),
+									],
+									{
+										authoritativeAliases: Boolean(
+											aliases?.get(searchee.infoHash)
+												?.length,
+										),
+									},
+								);
+								const pieces = getRuntimeConfig()
+									.seasonFromEpisodes
+									? createEnsemblePieces(
+											searchee.title,
+											searchee.files,
+										)
+									: null;
+								const published =
+									await replaceSourcePublication(trx, {
+										originId: origin.id,
+										expectedRevision: origin.revision,
+										revision: origin.revision + 1,
+										metadata: searchee,
+										status: "verified",
+										memberships:
+											pieces?.map((piece) => ({
+												path: join(
+													searchee.savePath,
+													piece.largestFile.path,
+												),
+												ensemble: piece.key,
+												element: String(piece.element),
+											})) ?? [],
+									});
+								if (!published)
+									throw new Error(
+										"Client source publication revision conflict",
+									);
+							}
+						},
+						knownAliases,
+					);
+					accepted &&= published;
+					if (published) await setImmediate();
+				},
+			);
+		}
+		return accepted;
+	} finally {
+		if (!lease)
+			for (const operation of leases.values())
+				releaseClientCacheOperation(operation);
+	}
 }
 
 export interface ClientSearcheeRow {
+	source_namespace_id?: string | null;
 	info_hash: string;
 	name: string;
 	title: string;

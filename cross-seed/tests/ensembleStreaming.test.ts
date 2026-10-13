@@ -14,6 +14,7 @@ import {
 const fixture = vi.hoisted(
 	(): {
 		count: number;
+		refreshPath: string;
 		host: string | null;
 		generated: number;
 		failAt: number;
@@ -23,6 +24,7 @@ const fixture = vi.hoisted(
 		dbAtLastSource: boolean;
 	} => ({
 		count: 600,
+		refreshPath: "/synthetic",
 		host: "synthetic-client",
 		generated: 0,
 		failAt: -1,
@@ -41,23 +43,32 @@ vi.mock("../src/clients/TorrentClient.js", () => ({
 		{
 			label: "Synthetic",
 			clientHost: "synthetic-client",
-			getClientSearchees: () =>
-				Promise.resolve({
-					searchees: Array.from(
-						{ length: fixture.count },
-						(_, i) => ({
-							infoHash: String(i),
-							name: "Review.Show.S01E01.mkv",
-							title: "Review.Show.S01E01.mkv",
-							length: 1,
-							clientHost: fixture.host ?? undefined,
-							savePath: "/synthetic",
-							files: [
-								{ name: String(i), path: String(i), length: 1 },
-							],
-						}),
-					),
-				}),
+			getClientSearchees: async () => {
+				const searchees = Array.from(
+					{ length: fixture.count },
+					(_, i) => ({
+						infoHash: String(i),
+						name: "Review.Show.S01E01.mkv",
+						title: "Review.Show.S01E01.mkv",
+						length: 1,
+						clientHost: fixture.host ?? "synthetic-client",
+						savePath: "/synthetic",
+						trackers: [],
+						files: [
+							{ name: String(i), path: String(i), length: 1 },
+						],
+					}),
+				);
+				const { upsertSearcheeClientDB } =
+					await import("../src/searchee.js");
+				await upsertSearcheeClientDB(
+					searchees.map((source) => ({
+						...source,
+						savePath: fixture.refreshPath,
+					})),
+				);
+				return { searchees };
+			},
 		},
 	],
 }));
@@ -87,7 +98,7 @@ let directory: string;
 let firstWriteAfterSources = 0;
 const onQuery = (query: { sql: string }) => {
 	if (
-		/^insert into [`"]ensemble_stage_\d+[`"]/.test(query.sql) &&
+		/^insert into [`"]ensemble_membership[`"]/.test(query.sql) &&
 		!firstWriteAfterSources
 	) {
 		firstWriteAfterSources = fixture.generated;
@@ -117,8 +128,13 @@ describe.sequential("cooperative ensemble refresh", () => {
 		database.db.on("query", onQuery);
 	});
 	beforeEach(async () => {
+		await database.db("ensemble_membership").del();
+		await database.db("source_alias").del();
+		await database.db("source_origin").del();
+		await database.db("physical_path").del();
 		await database.db("ensemble").del();
 		fixture.count = 600;
+		fixture.refreshPath = "/synthetic";
 		fixture.host = "synthetic-client";
 		fixture.generated = 0;
 		fixture.failAt = -1;
@@ -143,59 +159,69 @@ describe.sequential("cooperative ensemble refresh", () => {
 		delete process.env.CONFIG_DIR;
 		await rm(directory, { recursive: true, force: true });
 	});
-	it("does not start a write transaction for an empty client catalog", async () => {
-		fixture.count = 0;
-		const statements: string[] = [];
-		const collect = (query: { sql: string }) => {
-			statements.push(query.sql);
-		};
-		database.db.on("query", collect);
-		try {
-			await database.cleanupDB();
-		} finally {
-			database.db.removeListener("query", collect);
-		}
-		expect(statements.filter((sql) => /^BEGIN|^COMMIT/i.test(sql))).toEqual(
-			[],
-		);
-	});
 
-	it("writes bounded rows before generating the entire source catalog", async () => {
-		await database.cleanupDB();
+	async function runFixtureWriter() {
+		const { writeEnsembleTorrentEntries } =
+			await import("../src/ensembleWriter.js");
+		const { cacheEnsembleTorrentEntry } = await import("../src/torrent.js");
+		const sources = Array.from({ length: fixture.count }, (_, i) => ({
+			infoHash: String(i),
+			clientHost: fixture.host ?? undefined,
+			name: "Review.Show.S01E01.mkv",
+			title: "Review.Show.S01E01.mkv",
+			savePath: "/synthetic",
+			length: 1,
+			files: [{ name: String(i), path: String(i), length: 1 }],
+		}));
+		await writeEnsembleTorrentEntries(sources, cacheEnsembleTorrentEntry);
+	}
+	async function read() {
+		const { sourceMembershipQuery } = await import("../src/sourceStore.js");
+		return sourceMembershipQuery(database.db).orderBy("m.selection_order");
+	}
+	it("does not publish a source for an empty client catalog", async () => {
+		fixture.count = 0;
+		await runFixtureWriter();
+		expect(await read()).toEqual([]);
+		expect(
+			await database.db("source_origin").count({ n: "*" }).first(),
+		).toEqual({ n: 0 });
+	});
+	it("writes complete sources before generating the entire catalog and preserves all named aliases", async () => {
+		await runFixtureWriter();
 		expect(firstWriteAfterSources).toBeGreaterThan(0);
-		expect(firstWriteAfterSources).toBeLessThanOrEqual(256);
-		const rows = await database
-			.db("ensemble")
-			.select("info_hash", "ensemble")
-			.orderByRaw("rowid");
-		expect(rows).toEqual(
-			Array.from({ length: 600 }, (_, i) => ({
-				info_hash: String(i),
-				ensemble: "alias-2",
+		expect(firstWriteAfterSources).toBeLessThanOrEqual(64);
+		expect(
+			(await read()).map((r) => ({
+				info_hash: r.info_hash,
+				ensemble: r.ensemble,
 			})),
+		).toEqual(
+			Array.from({ length: 600 }, (_, i) =>
+				Array.from({ length: 3 }, (_, alias) => ({
+					info_hash: String(i),
+					ensemble: `alias-${alias}`,
+				})),
+			).flat(),
 		);
 	});
-	it("preserves ordered NULL-host aliases and exact repeats", async () => {
+	it("keeps NULL-host aliases idempotent across rebuilds", async () => {
 		fixture.count = 2;
 		fixture.host = null;
-		await database.cleanupDB();
-		await database.cleanupDB();
-		const rows = await database
-			.db("ensemble")
-			.select("path", "ensemble")
-			.orderByRaw("rowid");
-		expect(rows).toEqual(
-			Array.from({ length: 2 }, () =>
-				Array.from({ length: 2 }, (_, i) =>
-					Array.from({ length: 3 }, (_, alias) => ({
-						path: `/synthetic/${i}`,
-						ensemble: `alias-${alias}`,
-					})),
-				),
-			).flat(2),
+		await runFixtureWriter();
+		await runFixtureWriter();
+		expect(
+			(await read()).map((r) => ({ path: r.path, ensemble: r.ensemble })),
+		).toEqual(
+			Array.from({ length: 2 }, (_, i) =>
+				Array.from({ length: 3 }, (_, alias) => ({
+					path: `/synthetic/${i}`,
+					ensemble: `alias-${alias}`,
+				})),
+			).flat(),
 		);
 	});
-	it("retains existing named row order while updating the last alias", async () => {
+	it("does not overwrite a different named owner sharing the same path", async () => {
 		fixture.count = 2;
 		await database.db("ensemble").insert({
 			client_host: "synthetic-client",
@@ -204,18 +230,20 @@ describe.sequential("cooperative ensemble refresh", () => {
 			ensemble: "old",
 			element: "1",
 		});
-		await database.cleanupDB();
-		expect(
-			await database
-				.db("ensemble")
-				.select("path", "ensemble")
-				.orderByRaw("rowid"),
-		).toEqual([
-			{ path: "/synthetic/1", ensemble: "alias-2" },
-			{ path: "/synthetic/0", ensemble: "alias-2" },
+		await (
+			await import("../src/migrations/19-source-ownership.js")
+		).default.up(database.db);
+		await runFixtureWriter();
+		expect((await read()).map((r) => r.ensemble)).toEqual([
+			"old",
+			"alias-0",
+			"alias-1",
+			"alias-2",
+			"alias-0",
+			"alias-1",
+			"alias-2",
 		]);
 	});
-
 	it("generates concurrently in bounded groups without changing source order", async () => {
 		const { writeEnsembleTorrentEntries } =
 			await import("../src/ensembleWriter.js");
@@ -228,116 +256,119 @@ describe.sequential("cooperative ensemble refresh", () => {
 			length: 1,
 			files: [],
 		}));
-		await writeEnsembleTorrentEntries(
-			sources,
-			async (source, ...extra: unknown[]) => {
-				expect(extra).toEqual([]);
-				peak = Math.max(peak, ++active);
-				await new Promise((done) =>
-					setTimeout(done, Number(source.infoHash) % 2 ? 0 : 2),
-				);
-				active--;
-				return [
-					{
-						client_host: null,
-						path: `/synthetic/${source.infoHash}`,
-						info_hash: source.infoHash,
-						ensemble: "fixture",
-						element: source.infoHash,
-					},
-				];
-			},
-		);
+		await writeEnsembleTorrentEntries(sources, async (source) => {
+			peak = Math.max(peak, ++active);
+			await new Promise((done) =>
+				setTimeout(done, Number(source.infoHash) % 2 ? 0 : 2),
+			);
+			active--;
+			return [
+				{
+					client_host: null,
+					path: `/synthetic/${source.infoHash}`,
+					info_hash: source.infoHash,
+					ensemble: "fixture",
+					element: source.infoHash,
+				},
+			];
+		});
 		expect(peak).toBeGreaterThan(1);
 		expect(peak).toBeLessThanOrEqual(64);
-		expect(
-			(
-				await database
-					.db<{ info_hash: string }>("ensemble")
-					.select("info_hash")
-					.orderByRaw("rowid")
-			).map((row) => row.info_hash),
-		).toEqual(sources.map((source) => source.infoHash));
+		expect((await read()).map((r) => r.info_hash)).toEqual(
+			sources.map((s) => s.infoHash),
+		);
 	});
-
-	it("uses the bounded writer through actual startup torrent indexing", async () => {
+	it("uses source-owned publication through actual startup torrent indexing", async () => {
 		const { indexTorrentsAndDataDirs } = await import("../src/torrent.js");
 		await indexTorrentsAndDataDirs({ startup: true });
-		const rows = await database
-			.db<{ path: string; ensemble: string }>("ensemble")
-			.select("path", "ensemble")
-			.orderByRaw("rowid");
-		expect(rows).toEqual(
+		expect(
+			(await read()).map((r) => ({ path: r.path, ensemble: r.ensemble })),
+		).toEqual(
 			Array.from({ length: 600 }, (_, i) => ({
 				path: `/synthetic/${i}`,
 				ensemble: "reviewshow.S1",
 			})),
 		);
-		expect(
-			await database.db.raw(
-				"SELECT name FROM sqlite_temp_master WHERE name LIKE 'ensemble_stage_%'",
-			),
-		).toEqual([]);
 	});
-
 	it("lets timers run before finishing a large membership rebuild", async () => {
 		const immediate = setImmediate(() => {
 			fixture.timerObserved = true;
 		});
 		try {
-			await database.cleanupDB();
+			await runFixtureWriter();
 			expect(fixture.timerAtLastSource).toBe(true);
 		} finally {
 			clearImmediate(immediate);
 		}
 	});
-	it("allows other database readers during staged generation", async () => {
-		await database.cleanupDB();
+	it("allows other database readers between complete source transactions", async () => {
+		await runFixtureWriter();
 		expect(fixture.dbAtLastSource).toBe(true);
-		const tables: unknown = await database.db.raw(
-			"SELECT name FROM sqlite_temp_master WHERE name LIKE 'ensemble_stage_%'",
-		);
-		expect(tables).toEqual([]);
 	});
-
-	it("rolls back streamed writes when later source generation fails", async () => {
-		await database.db("ensemble").insert({
-			client_host: null,
-			path: "/synthetic/original",
-			ensemble: "original",
-			element: "1",
-		});
+	it("retains successful source publications and invalidates health when later generation fails", async () => {
+		const { getHealthGeneration } =
+			await import("../src/healthGeneration.js");
+		const before = getHealthGeneration();
 		fixture.failAt = 401;
-		await expect(database.cleanupDB()).rejects.toThrow(
+		await expect(runFixtureWriter()).rejects.toThrow(
 			"synthetic generation failure",
 		);
-		expect(
-			await database.db.raw(
-				"SELECT name FROM sqlite_temp_master WHERE name LIKE 'ensemble_stage_%'",
-			),
-		).toEqual([]);
-		expect(await database.db("ensemble").select("path")).toEqual([
-			{ path: "/synthetic/original" },
-		]);
+		const rows = await read();
+		expect(rows.some((r) => r.info_hash === "400")).toBe(true);
+		expect(rows.some((r) => r.info_hash === "401")).toBe(false);
+		expect(rows.filter((r) => r.info_hash === "400")).toHaveLength(3);
+		expect(getHealthGeneration()).toBeGreaterThan(before);
 	});
-	it("rolls back all membership batches after a later SQL failure", async () => {
+	it("rolls back the failed source while keeping earlier commits after later SQL failure", async () => {
+		const { getHealthGeneration } =
+			await import("../src/healthGeneration.js");
+		const before = getHealthGeneration();
 		await database.db.raw(
-			`CREATE TRIGGER fail_stream BEFORE INSERT ON ensemble WHEN NEW.path='/synthetic/401' BEGIN SELECT RAISE(ABORT, 'synthetic SQL failure'); END`,
+			`CREATE TRIGGER fail_stream BEFORE INSERT ON ensemble_membership WHEN NEW.element='401' BEGIN SELECT RAISE(ABORT,'synthetic SQL failure'); END`,
 		);
 		try {
-			await expect(database.cleanupDB()).rejects.toThrow(
+			await expect(runFixtureWriter()).rejects.toThrow(
 				"synthetic SQL failure",
 			);
+			const rows = await read();
+			expect(rows).toHaveLength(401 * 3);
+			expect(rows.some((r) => r.info_hash === "401")).toBe(false);
 			expect(
-				await database.db.raw(
-					"SELECT name FROM sqlite_temp_master WHERE name LIKE 'ensemble_stage_%'",
-				),
-			).toEqual([]);
-			expect(
-				await database.db("ensemble").count("* as n").first(),
-			).toEqual({ n: 0 });
+				await database
+					.db<{
+						revision: number;
+						source_key: string;
+					}>("source_origin")
+					.where({ source_key: "401" })
+					.first(),
+			).toBeUndefined();
+			expect(getHealthGeneration()).toBeGreaterThan(before);
 		} finally {
 			await database.db.raw("DROP TRIGGER fail_stream");
 		}
+	});
+	it("actual cleanup keeps atomic cached memberships instead of regenerating returned RPC arrays", async () => {
+		fixture.count = 2;
+		fixture.refreshPath = "/latest";
+		const { upsertSearcheeClientDB } = await import("../src/searchee.js");
+		const cached = Array.from({ length: 2 }, (_, i) => ({
+			infoHash: String(i),
+			clientHost: "synthetic-client",
+			name: "Review.Show.S01E01.mkv",
+			title: "Review.Show.S01E01.mkv",
+			savePath: "/latest",
+			length: 1,
+			trackers: [],
+			files: [{ name: String(i), path: String(i), length: 1 }],
+		}));
+		await upsertSearcheeClientDB(cached);
+		const before = await read();
+		await database.cleanupDB();
+		expect(await read()).toEqual(before);
+		expect((await read()).map((r) => r.path)).toEqual([
+			"/latest/0",
+			"/latest/1",
+		]);
+		expect(fixture.generated).toBe(0);
 	});
 });

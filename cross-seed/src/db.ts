@@ -1,9 +1,20 @@
+import { performance } from "node:perf_hooks";
+import {
+	performanceRecorder,
+	recordPerformance,
+} from "./performanceTelemetry.js";
+import {
+	sourceMembershipQuery,
+	type SourceMembershipRow,
+} from "./sourceStore.js";
+import { invalidateHealth } from "./healthGeneration.js";
 import { access, unlink } from "fs/promises";
 import knex from "knex";
 import type { Knex } from "knex";
 import BetterSqlite3ClientImport from "knex/lib/dialects/better-sqlite3/index.js";
 import ms from "ms";
 import { DatabaseSync } from "node:sqlite";
+import { SqliteWorkerConnection } from "./sqliteWorker.js";
 import { setImmediate } from "node:timers/promises";
 import { basename, join } from "path";
 import { getClients } from "./clients/TorrentClient.js";
@@ -12,18 +23,15 @@ import { TORRENT_CACHE_FOLDER } from "./constants.js";
 import { getCachedTorrentName, rebuildGuidInfoHashMap } from "./decide.js";
 import { Label, logger } from "./logger.js";
 import { getRuntimeConfig } from "./runtimeConfig.js";
-import { writeEnsembleTorrentEntries } from "./ensembleWriter.js";
 import { migrations } from "./migrations/migrations.js";
 import { Metafile } from "./parseTorrent.js";
 import {
-	cacheEnsembleTorrentEntry,
 	findAllTorrentFilesInDir,
 	parseTorrentFromPath,
 	snatchHistory,
 } from "./torrent.js";
 import {
 	filterAsync,
-	flatMapAsync,
 	errorMessage,
 	getLogString,
 	humanReadableDate,
@@ -55,12 +63,14 @@ export class NodeSqliteClient extends BetterSqlite3Client {
 	}
 
 	// Get a raw connection from the database, returning a promise with the connection object.
-	// eslint-disable-next-line @typescript-eslint/require-await
 	async acquireRawConnection() {
 		const { filename } = this
 			.connectionSettings as Knex.BetterSqlite3ConnectionConfig;
+		if (process.env.CROSS_SEED_SQLITE_WORKER === "1") {
+			return SqliteWorkerConnection.open(filename);
+		}
 		const connection = new this.driver(filename);
-		connection.exec("pragma journal_mode = WAL;");
+		connection.exec("pragma journal_mode = WAL; pragma foreign_keys = ON;");
 		return connection;
 	}
 
@@ -80,7 +90,6 @@ export class NodeSqliteClient extends BetterSqlite3Client {
 			throw new Error("No connection provided");
 		}
 
-		const statement = connection.prepare(obj.sql);
 		const bindings = formatBindings(obj.bindings);
 
 		const method = obj.method;
@@ -99,15 +108,23 @@ export class NodeSqliteClient extends BetterSqlite3Client {
 		}
 		if (method == null) {
 			const sql = obj.sql.trim().toLowerCase();
-			useAll = Boolean(obj.returning) || sql.startsWith("select");
+			useAll =
+				Boolean(obj.returning) ||
+				/^(select|pragma|explain|with)\b/.test(sql);
 		}
 
 		if (useAll) {
-			obj.response = await statement.all(...bindings);
+			obj.response =
+				connection instanceof SqliteWorkerConnection
+					? await connection.execute(obj.sql, bindings, true)
+					: connection.prepare(obj.sql).all(...bindings);
 			return obj;
 		}
 
-		const response = await statement.run(...bindings);
+		const response =
+			connection instanceof SqliteWorkerConnection
+				? await connection.execute(obj.sql, bindings, false)
+				: connection.prepare(obj.sql).run(...bindings);
 		obj.response = response;
 		obj.context = {
 			lastID: response.lastInsertRowid,
@@ -125,6 +142,8 @@ const filename = join(appDir(), "cross-seed.db");
 export const db = knex({
 	client: NodeSqliteClient,
 	connection: { filename },
+	// TEMP staging and transactions have exactly one connection owner.
+	pool: { min: 1, max: 1 },
 	migrations: { migrationSource: migrations },
 	useNullAsDefault: true,
 });
@@ -142,12 +161,24 @@ async function pruneMissingCachedPaths(
 	let processed = 0;
 	let pages = 0;
 	for (;;) {
-		const pathsFrom = (table: "data" | "ensemble") => {
-			const query = db<{ path: string }>(table)
-				.select("path")
-				.whereNotNull("path");
+		const pathsFrom = (
+			table: "data" | "ensemble",
+		): Knex.QueryBuilder<{ path: string }, { path: string }[]> => {
+			const query =
+				table === "data"
+					? db<{ path: string }>("data")
+							.select<{ path: string }[]>("path")
+							.whereNotNull("path")
+					: db<{ path: string }>()
+							.from(sourceMembershipQuery(db).as("memberships"))
+							.select<{ path: string }[]>("path");
 			if (lastPath !== undefined) query.where("path", ">", lastPath);
-			return query;
+			// Both SQL branches select exactly one path. Knex's aliased
+			// subquery overload loses that record type at this boundary.
+			return query as unknown as Knex.QueryBuilder<
+				{ path: string },
+				{ path: string }[]
+			>;
 		};
 		const query = dataDirs.length
 			? pathsFrom("data")
@@ -155,11 +186,21 @@ async function pruneMissingCachedPaths(
 		if (dataDirs.length && seasonFromEpisodes) {
 			query.union(pathsFrom("ensemble"));
 		} else {
-			query.distinct("path");
+			query.distinct(db.raw("path"));
 		}
 		const page = await query.orderBy("path", "asc").limit(512);
 		if (!page.length) return;
 		lastPath = page[page.length - 1].path;
+		// Capture revisions before filesystem awaits. A watcher or refresh that
+		// publishes during the probe keeps its new source visible.
+		const observed = await sourceMembershipQuery(db)
+			.whereIn(
+				"p.path",
+				page.map((row) => row.path),
+			)
+			.select<Array<SourceMembershipRow & { revision: number }>>(
+				"o.revision",
+			);
 		let uncertainPaths = 0;
 		const missingPaths: string[] = [];
 		await inBatches(
@@ -216,10 +257,31 @@ async function pruneMissingCachedPaths(
 			await inBatches(
 				missingPaths,
 				async (batch) => {
+					let changed = false;
 					await db.transaction(async (trx) => {
-						await trx("data").whereIn("path", batch).del();
-						await trx("ensemble").whereIn("path", batch).del();
+						const revisions = [
+							...new Map(
+								observed
+									.filter((row) => batch.includes(row.path))
+									.map((row) => [
+										row.origin_id,
+										[row.origin_id, row.revision],
+									]),
+							).values(),
+						];
+						if (revisions.length) {
+							// A single bounded update checks every captured revision.
+							changed = Boolean(
+								await trx("source_origin")
+									.whereIn(["id", "revision"], revisions)
+									.update({
+										state: "unavailable",
+										revision: trx.raw("revision + 1"),
+									}),
+							);
+						}
 					});
+					if (changed) invalidateHealth();
 				},
 				{ batchSize: 64 },
 			);
@@ -243,6 +305,31 @@ async function pruneMissingCachedPaths(
 }
 
 export async function cleanupDB(): Promise<void> {
+	if (process.env.CROSS_SEED_PERFORMANCE_TELEMETRY !== "1")
+		return cleanupDBImpl();
+	const started = performance.now();
+	let sqlQueries = 0;
+	const count = () => {
+		sqlQueries++;
+	};
+	db.on("query", count);
+	try {
+		await cleanupDBImpl();
+	} finally {
+		db.off("query", count);
+		recordPerformance({
+			operation: "cleanup",
+			durationMs: performance.now() - started,
+			sqlQueries,
+		});
+		logger.verbose({
+			label: Label.CLEANUP,
+			message: `Aggregate performance: ${JSON.stringify(performanceRecorder.snapshot())}`,
+		});
+	}
+}
+
+async function cleanupDBImpl(): Promise<void> {
 	const {
 		dataDirs,
 		excludeRecentSearch,
@@ -255,29 +342,23 @@ export async function cleanupDB(): Promise<void> {
 			label: Label.CLEANUP,
 			message: "Refreshing all client torrents...",
 		});
-		const searchees = await flatMapAsync(getClients(), async (client) => {
+		// Each adapter commits authoritative metadata and memberships together.
+		// Release a client's returned catalog before refreshing the next one;
+		// never regenerate from an RPC array after its publication lease ended.
+		for (const client of getClients()) {
 			try {
-				return (
-					await client.getClientSearchees({
-						refresh: [],
-						includeFiles: true,
-						includeTrackers: true,
-					})
-				).searchees;
+				await client.getClientSearchees({
+					refresh: [],
+					includeFiles: true,
+					includeTrackers: true,
+				});
 			} catch (error) {
 				logger.error({
 					label: Label.CLEANUP,
 					message: `Failed to refresh ${client.label}: ${error instanceof Error ? error.message : String(error)}`,
 				});
-				return [];
 			}
-		});
-		if (!seasonFromEpisodes) return;
-		logger.verbose({
-			label: Label.CLEANUP,
-			message: "Refreshing all ensemble torrents...",
-		});
-		await writeEnsembleTorrentEntries(searchees, cacheEnsembleTorrentEntry);
+		}
 	})();
 	if (dataDirs.length || seasonFromEpisodes) {
 		logger.verbose({

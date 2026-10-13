@@ -1,3 +1,5 @@
+import { performance } from "node:perf_hooks";
+import { recordPerformance } from "./performanceTelemetry.js";
 import bencode from "bencode";
 import { readFile, stat, unlink, utimes, writeFile } from "fs/promises";
 import ms from "ms";
@@ -594,6 +596,40 @@ function releaseVersionDoesMatch(searcheeName: string, candidateName: string) {
 }
 
 export async function assessCandidate(
+	metaOrCandidate: Metafile | Candidate,
+	searchee: SearcheeWithLabel,
+	infoHashesToExclude: Set<string>,
+	blockList: string[],
+	options?: { configOverride: Partial<RuntimeConfig> },
+): Promise<ResultAssessment> {
+	if (process.env.CROSS_SEED_PERFORMANCE_TELEMETRY !== "1") {
+		return assessCandidateImpl(
+			metaOrCandidate,
+			searchee,
+			infoHashesToExclude,
+			blockList,
+			options,
+		);
+	}
+	const started = performance.now();
+	try {
+		return await assessCandidateImpl(
+			metaOrCandidate,
+			searchee,
+			infoHashesToExclude,
+			blockList,
+			options,
+		);
+	} finally {
+		recordPerformance({
+			operation: "candidate",
+			durationMs: performance.now() - started,
+			fileCount: searchee.files.length,
+		});
+	}
+}
+
+async function assessCandidateImpl(
 	metaOrCandidate: Metafile | Candidate,
 	searchee: SearcheeWithLabel,
 	infoHashesToExclude: Set<string>,

@@ -1,73 +1,141 @@
 import { setImmediate } from "node:timers/promises";
+import { relative } from "node:path";
 import { db } from "./db.js";
 import type { EnsembleEntry } from "./torrent.js";
 import type { SearcheeWithInfoHash } from "./searchee.js";
+import { getRuntimeConfig } from "./runtimeConfig.js";
+import {
+	clientSourceLocator,
+	findSourceOrigin,
+	ensureSourceNamespace,
+	resolveSourceOrigin,
+	replaceSourcePublication,
+	type SourceOrigin,
+} from "./sourceStore.js";
+import {
+	beginClientCacheOperation,
+	publishClientCacheBatch,
+	releaseClientCacheOperation,
+	ClientCacheConcurrencyError,
+	type ClientCacheLease,
+} from "./clientCachePublication.js";
 
-let nextStageId = 0;
-
-/**
- * Stage bounded rows without reserving SQLite's sole connection during generation.
- * The ordered atomic apply preserves the old conflict/winner and rollback semantics.
- * The final statement still blocks timers. Client/file arrays and generated
- * entries for up to 64 concurrent sources remain materialized. TEMP staging
- * relies on SQLite's one-entry pool.
- */
+/** Generate outside SQLite; namespace leases order scans and origin CAS guards publication. */
 export async function writeEnsembleTorrentEntries(
 	sources: readonly SearcheeWithInfoHash[],
 	createEntries: (
 		source: SearcheeWithInfoHash,
 	) => Promise<EnsembleEntry[] | null>,
-): Promise<void> {
-	if (!sources.length) return;
-	const stage = `ensemble_stage_${++nextStageId}`;
-	await db.raw(
-		`CREATE TEMP TABLE ?? (seq INTEGER PRIMARY KEY, client_host TEXT, path TEXT NOT NULL, info_hash TEXT, ensemble TEXT NOT NULL, element TEXT NOT NULL)`,
-		[stage],
-	);
+	operation?: ClientCacheLease,
+): Promise<{ complete: boolean; unavailable: boolean }> {
+	const owned = new Map<string, ClientCacheLease>();
+	let complete = true;
+	let unavailable = false;
 	try {
-		let rows: (EnsembleEntry & { seq: number })[] = [];
-		let sequence = 0;
-		let sourcesSinceYield = 0;
-		const flush = async () => {
-			if (!rows.length) return;
-			await db(stage).insert(rows);
-			rows = [];
-			sourcesSinceYield = 0;
-			await setImmediate();
-		};
-
 		for (let offset = 0; offset < sources.length; offset += 64) {
-			// Wait for the entire bounded group, including failures, so no client
-			// reads outlive this rebuild and ordered callbacks never write staging.
-			const generated = await Promise.allSettled(
-				sources
-					.slice(offset, offset + 64)
-					.map((source) => createEntries(source)),
-			);
-			const failure = generated.find(
-				(result) => result.status === "rejected",
-			);
-			if (failure) throw failure.reason;
-			for (const result of generated) {
-				if (result.status !== "fulfilled") continue;
-				for (const entry of result.value ?? []) {
-					rows.push({ ...entry, seq: ++sequence });
-					if (rows.length === 500) await flush();
+			const prepared: Array<{
+				source: SearcheeWithInfoHash;
+				origin: SourceOrigin | undefined;
+				key: string;
+				namespace: string;
+				lease: ClientCacheLease;
+			}> = [];
+			for (const source of sources.slice(offset, offset + 64)) {
+				const torrentDir = getRuntimeConfig().torrentDir;
+				const ns = await ensureSourceNamespace(
+					db,
+					source.clientHost ? "client" : "torrent-directory",
+					source.clientHost
+						? clientSourceLocator(source.clientHost)
+						: (torrentDir ?? "unconfigured-torrent-directory"),
+				);
+				const key = source.clientHost
+					? source.infoHash
+					: source.torrentFilePath && torrentDir
+						? relative(torrentDir, source.torrentFilePath)
+						: (source.torrentFilePath ?? source.infoHash);
+				const owner = source.clientHost ?? `filesystem:${ns}`;
+				let lease = operation ?? owned.get(owner);
+				if (!lease) {
+					lease = beginClientCacheOperation(owner);
+					owned.set(owner, lease);
 				}
-				if (++sourcesSinceYield === 256) {
-					sourcesSinceYield = 0;
-					await setImmediate();
+				const current = await findSourceOrigin(db, ns, key);
+				const origin =
+					current &&
+					source.sourceOriginId === current.id &&
+					source.sourceRevision !== undefined
+						? { ...current, revision: source.sourceRevision }
+						: current;
+				if (source.clientHost && current?.state === "verified")
+					continue;
+				prepared.push({ source, origin, key, lease, namespace: ns });
+			}
+			const generated = await Promise.allSettled(
+				prepared.map(({ source }) => createEntries(source)),
+			);
+			for (let i = 0; i < generated.length; i++) {
+				const result = generated[i];
+				if (result.status !== "fulfilled") continue;
+				if (result.value === null) {
+					complete = false;
+					unavailable = true;
+					continue;
+				}
+				const { source, origin, key, lease, namespace } = prepared[i];
+				const memberships = result.value.map((m) => ({
+					path: m.path,
+					ensemble: m.ensemble,
+					element: String(m.element),
+				}));
+				try {
+					complete =
+						(await publishClientCacheBatch(
+							lease,
+							[key],
+							async (trx) => {
+								const acceptedOrigin =
+									origin ??
+									(await resolveSourceOrigin(
+										trx,
+										namespace,
+										key,
+									));
+								if (
+									!(await replaceSourcePublication(trx, {
+										originId: acceptedOrigin.id,
+										expectedRevision:
+											acceptedOrigin.revision,
+										revision: acceptedOrigin.revision + 1,
+										metadata: source,
+										memberships,
+										status: "verified",
+									}))
+								)
+									throw new ClientCacheConcurrencyError();
+								if (source.torrentFilePath)
+									await trx("torrent")
+										.insert({
+											file_path: source.torrentFilePath,
+											info_hash: source.infoHash,
+											name: source.name,
+										})
+										.onConflict("file_path")
+										.merge();
+							},
+						)) && complete;
+				} catch (error) {
+					if (!(error instanceof ClientCacheConcurrencyError))
+						throw error;
+					complete = false;
 				}
 			}
+			const failed = generated.find((r) => r.status === "rejected");
+			if (failed?.status === "rejected") throw failed.reason;
+			await setImmediate();
 		}
-
-		await flush();
-		if (sequence)
-			await db.raw(
-				`INSERT INTO ensemble(client_host,path,info_hash,ensemble,element) SELECT client_host,path,info_hash,ensemble,element FROM ?? WHERE 1 ORDER BY seq ON CONFLICT(client_host,path) DO UPDATE SET info_hash=excluded.info_hash,ensemble=excluded.ensemble,element=excluded.element`,
-				[stage],
-			);
+		return { complete, unavailable };
 	} finally {
-		await db.raw("DROP TABLE ??", [stage]);
+		for (const lease of owned.values()) releaseClientCacheOperation(lease);
 	}
 }

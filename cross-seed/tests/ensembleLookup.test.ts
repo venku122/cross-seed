@@ -42,6 +42,13 @@ describe.sequential("ensemble lookup", () => {
 	});
 
 	async function lookup() {
+		// Model the initial import; production never reruns migration on lookup.
+		await (
+			await import("../src/migrations/19-source-ownership.js")
+		).default.up(db);
+		await (
+			await import("../src/migrations/19-source-ownership.js")
+		).default.up(db);
 		const { checkNewCandidateMatch } = await import("../src/pipeline.js");
 		const { Label } = await import("../src/logger.js");
 		await checkNewCandidateMatch(
@@ -184,7 +191,7 @@ describe.sequential("ensemble lookup", () => {
 		]);
 	});
 
-	it("checks repeated missing paths once and retains existing path-wide cleanup", async () => {
+	it("checks repeated missing paths once without treating an unavailable mount as deletion", async () => {
 		await db.migrate.latest();
 		const path = join(root, "missing.mkv");
 		const row = {
@@ -206,8 +213,8 @@ describe.sequential("ensemble lookup", () => {
 		expect(existence.mock.calls.filter(([p]) => p === path)).toHaveLength(
 			1,
 		);
-		expect(await db("ensemble").where({ path })).toEqual([]);
-		expect(await db("data").where({ path })).toEqual([]);
+		expect(await db("ensemble").where({ path })).toHaveLength(3);
+		expect(await db("data").where({ path })).toHaveLength(1);
 		expect(assessed).toEqual([]);
 	});
 	afterEach(async () => {
@@ -275,14 +282,14 @@ describe.sequential("ensemble lookup", () => {
 				await db.raw<{ name: string }[]>("PRAGMA index_list(ensemble)")
 			).map((i) => i.name),
 		).toContain("ensemble_key_index");
-		await db.migrate.down();
+		await db.migrate.down({ name: "18-ensemble-lookup-index" });
 		expect(
 			(
 				await db.raw<{ name: string }[]>("PRAGMA index_list(ensemble)")
 			).map((i) => i.name),
 		).not.toContain("ensemble_key_index");
 		expect(await db("ensemble").orderBy("rowid")).toEqual(before);
-		await db.migrate.up();
+		await db.migrate.up({ name: "18-ensemble-lookup-index" });
 		expect(await db("ensemble").orderBy("rowid")).toEqual(before);
 		expect(
 			await db("ensemble")
@@ -332,6 +339,9 @@ describe.sequential("ensemble lookup", () => {
 				element: "1",
 			},
 		]);
+		await (
+			await import("../src/migrations/19-source-ownership.js")
+		).default.up(db);
 		const { checkNewCandidateMatch } = await import("../src/pipeline.js");
 		const { Label } = await import("../src/logger.js");
 		await checkNewCandidateMatch(

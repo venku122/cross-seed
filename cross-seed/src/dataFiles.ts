@@ -1,12 +1,26 @@
+import type { Knex } from "knex";
 import { FSWatcher, watch } from "fs";
 import { readdir, readFile, stat } from "fs/promises";
-import { basename, dirname, extname, join, resolve, sep } from "path";
+import { basename, dirname, extname, join, resolve, sep, relative } from "path";
 import {
 	IGNORED_FOLDERS_SUBSTRINGS,
 	LEVENSHTEIN_DIVISOR,
 	VIDEO_EXTENSIONS,
 } from "./constants.js";
 import { db } from "./db.js";
+import {
+	ensureSourceNamespace,
+	resolveSourceOrigin,
+	replaceSourcePublication,
+	type SourceOrigin,
+} from "./sourceStore.js";
+import {
+	beginClientCacheOperation,
+	publishClientCacheBatch,
+	releaseClientCacheOperation,
+	ClientCacheConcurrencyError,
+	type ClientCacheLease,
+} from "./clientCachePublication.js";
 import { Label, logger } from "./logger.js";
 import { getRuntimeConfig } from "./runtimeConfig.js";
 import {
@@ -24,7 +38,6 @@ import {
 	filterAsync,
 	filterAsyncYield,
 	flatMapAsync,
-	inBatches,
 	isTruthy,
 	mapAsync,
 	yieldToEventLoop,
@@ -63,122 +76,210 @@ export async function indexDataDirs(options: {
 }): Promise<void> {
 	const { dataDirs, maxDataDepth } = getRuntimeConfig();
 	if (!dataDirs.length) return;
-
-	if (options.startup) {
-		logger.info({
-			label: Label.INDEX,
-			message: "Indexing dataDirs for reverse lookup...",
-		});
-		for (const dataDir of dataDirs) {
-			modifiedPaths.set(dataDir, new Set());
-			modifiedPathTimes.set(dataDir, new Map());
-			watchers.set(dataDir, createWatcher(dataDir));
-		}
-		const searcheePaths = await findSearcheesFromAllDataDirs();
-		const maxUserWatchesPath = "/proc/sys/fs/inotify/max_user_watches";
-		if (await exists(maxUserWatchesPath)) {
-			const limit = parseInt(await readFile(maxUserWatchesPath, "utf8"));
-			if (limit < searcheePaths.length * 2) {
-				logger.error(
-					`max_user_watches too low for proper indexing of dataDirs. It is recommended to set fs.inotify.max_user_watches=1048576 in /etc/sysctl.conf (only on the host system if using docker) - current: ${limit}`,
-				);
+	const operations = await createDataOperations(dataDirs);
+	try {
+		if (options.startup) {
+			logger.info({
+				label: Label.INDEX,
+				message: "Indexing dataDirs for reverse lookup...",
+			});
+			for (const dataDir of dataDirs) {
+				modifiedPaths.set(dataDir, new Set());
+				modifiedPathTimes.set(dataDir, new Map());
+				watchers.set(dataDir, createWatcher(dataDir));
 			}
+			const searcheePaths = await findSearcheesFromAllDataDirs();
+			const maxUserWatchesPath = "/proc/sys/fs/inotify/max_user_watches";
+			if (await exists(maxUserWatchesPath)) {
+				const limit = parseInt(
+					await readFile(maxUserWatchesPath, "utf8"),
+				);
+				if (limit < searcheePaths.length * 2) {
+					logger.error(
+						`max_user_watches too low for proper indexing of dataDirs. It is recommended to set fs.inotify.max_user_watches=1048576 in /etc/sysctl.conf (only on the host system if using docker) - current: ${limit}`,
+					);
+				}
+			}
+			const numEntries = await indexDataPaths(searcheePaths, operations);
+			logger.info(`Validated ${numEntries} entries from dataDirs...`);
 		}
-		const numEntries = await indexDataPaths(searcheePaths);
-		logger.info(`Validated ${numEntries} entries from dataDirs...`);
-	}
 
-	await mapAsync(dataDirs, async (dataDir) => {
-		const modified = modifiedPaths.get(dataDir)!;
-		const modifiedTimes = modifiedPathTimes.get(dataDir)!;
-		const eventPaths: string[] = [];
-		const now = Date.now();
-		for (const path of modified) {
-			const lastSeen = modifiedTimes.get(path) ?? 0;
-			if (now - lastSeen < STABILITY_WINDOW_MS) continue;
-			if (!modified.delete(path)) continue;
-			modifiedTimes.delete(path);
-			eventPaths.push(path);
-		}
-		if (!eventPaths.length) return;
-		logger.verbose(`Indexing dataDir ${dataDir} due to recent changes...`);
-		eventPaths.sort(
-			(a, b) =>
-				b.split(sep).filter(isTruthy).length -
-				a.split(sep).filter(isTruthy).length,
-		);
-		const deletedPaths: string[] = [];
-		const paths = await filterAsync(
-			Array.from(
-				eventPaths.reduce<Set<string>>((acc, path) => {
-					const affectedPaths: string[] = [path];
-					let parentPath = dirname(path);
-					while (resolve(parentPath) !== resolve(dataDir)) {
-						affectedPaths.push(parentPath);
-						parentPath = dirname(parentPath);
-					}
-					for (const affectedPath of affectedPaths.slice(
-						-maxDataDepth,
-					)) {
-						acc.add(affectedPath);
-					}
-					return acc;
-				}, new Set()),
-			),
-			async (path) => {
-				if (await exists(path)) return true;
-				deletedPaths.push(path);
-				return false;
-			},
-		);
-		await inBatches(deletedPaths, async (batch) => {
-			await db("data").whereIn("path", batch).del();
-			await db("ensemble").whereIn("path", batch).del();
+		await mapAsync(dataDirs, async (dataDir) => {
+			const modified = modifiedPaths.get(dataDir)!;
+			const modifiedTimes = modifiedPathTimes.get(dataDir)!;
+			const eventPaths: string[] = [];
+			const now = Date.now();
+			for (const path of modified) {
+				const lastSeen = modifiedTimes.get(path) ?? 0;
+				if (now - lastSeen < STABILITY_WINDOW_MS) continue;
+				if (!modified.delete(path)) continue;
+				modifiedTimes.delete(path);
+				eventPaths.push(path);
+			}
+			if (!eventPaths.length) return;
+			logger.verbose(
+				`Indexing dataDir ${dataDir} due to recent changes...`,
+			);
+			eventPaths.sort(
+				(a, b) =>
+					b.split(sep).filter(isTruthy).length -
+					a.split(sep).filter(isTruthy).length,
+			);
+			const deletedPaths: string[] = [];
+			const paths = await filterAsync(
+				Array.from(
+					eventPaths.reduce<Set<string>>((acc, path) => {
+						const affectedPaths: string[] = [path];
+						let parentPath = dirname(path);
+						while (resolve(parentPath) !== resolve(dataDir)) {
+							affectedPaths.push(parentPath);
+							parentPath = dirname(parentPath);
+						}
+						for (const affectedPath of affectedPaths.slice(
+							-maxDataDepth,
+						)) {
+							acc.add(affectedPath);
+						}
+						return acc;
+					}, new Set()),
+				),
+				async (path) => {
+					if (await exists(path)) return true;
+					deletedPaths.push(path);
+					return false;
+				},
+			);
+			// Missing paths are retained until authoritative source validation.
+			void deletedPaths;
+			await indexDataPaths(paths, operations);
 		});
-		await indexDataPaths(paths);
-	});
+	} finally {
+		for (const lease of operations.values())
+			releaseClientCacheOperation(lease);
+	}
 }
 
 /**
  * Adds the data and ensemble entries to the database.
  * @param paths The paths to index.
  */
-async function indexDataPaths(paths: string[]): Promise<number> {
-	const { seasonFromEpisodes } = getRuntimeConfig();
+async function createDataOperations(
+	roots: string[],
+): Promise<Map<string, ClientCacheLease>> {
+	const operations = new Map<string, ClientCacheLease>();
+	for (const root of roots) {
+		const namespace = await ensureSourceNamespace(db, "data-root", root);
+		operations.set(
+			root,
+			beginClientCacheOperation(`filesystem:${namespace}`),
+		);
+	}
+	return operations;
+}
+export async function indexDataPaths(
+	paths: string[],
+	captured?: ReadonlyMap<string, ClientCacheLease>,
+): Promise<number> {
+	const { seasonFromEpisodes, dataDirs } = getRuntimeConfig();
 	const memoizedPaths = new Map<string, string[]>();
 	const memoizedLengths = new Map<string, number>();
-	const dataRows: DataEntry[] = [];
-	const ensembleRows: EnsembleEntry[] = [];
 	let processed = 0;
-	for (const path of paths) {
-		processed += 1;
-		if (processed % 500 === 0) {
-			await yieldToEventLoop();
+	const operations = captured ?? (await createDataOperations(dataDirs));
+	try {
+		for (const path of paths) {
+			const owners = dataDirs.filter((root) => {
+				const key = relative(root, path);
+				return (
+					key === "" ||
+					(!key.startsWith(`..${sep}`) &&
+						key !== ".." &&
+						!key.startsWith(sep))
+				);
+			});
+			const origins: Array<{
+				origin: SourceOrigin;
+				root: string;
+				key: string;
+			}> = [];
+			for (const root of owners) {
+				const ns = await ensureSourceNamespace(db, "data-root", root);
+				origins.push({
+					origin: await resolveSourceOrigin(
+						db,
+						ns,
+						relative(root, path) || ".",
+					),
+					root,
+					key: relative(root, path) || ".",
+				});
+			}
+			// Revision is captured before filesystem traversal. Empty results from this
+			// legacy scanner are ambiguous (it catches I/O errors), so preserve owners.
+			const files = await getFilesFromDataRoot(
+				path,
+				memoizedPaths,
+				memoizedLengths,
+			);
+			if (!files.length) continue;
+			const title = parseTitle(basename(path), files, path);
+			if (!title) continue;
+			const memberships = seasonFromEpisodes
+				? (indexEnsembleDataEntry(title, path, files) ?? [])
+				: [];
+			let committed = false;
+			for (const { origin, root, key } of origins) {
+				try {
+					committed =
+						(await publishClientCacheBatch(
+							operations.get(root)!,
+							[key],
+							async (trx) => {
+								if (
+									!(await replaceSourcePublication(trx, {
+										originId: origin.id,
+										expectedRevision: origin.revision,
+										revision: origin.revision + 1,
+										metadata: {
+											path,
+											title,
+											name: basename(path),
+											files,
+											length: files.reduce(
+												(n, f) => n + f.length,
+												0,
+											),
+										},
+										memberships: memberships.map((m) => ({
+											path: m.path,
+											ensemble: m.ensemble,
+											element: String(m.element),
+										})),
+										status: "verified",
+									}))
+								)
+									throw new ClientCacheConcurrencyError();
+								await trx("data")
+									.insert({ title, path })
+									.onConflict("path")
+									.merge();
+							},
+						)) || committed;
+				} catch (error) {
+					if (!(error instanceof ClientCacheConcurrencyError))
+						throw error;
+				}
+			}
+			if (committed) {
+				processed++;
+			}
+			if (processed % 500 === 0) await yieldToEventLoop();
 		}
-		const files = await getFilesFromDataRoot(
-			path,
-			memoizedPaths,
-			memoizedLengths,
-		);
-		if (!files.length) continue;
-		const title = parseTitle(basename(path), files, path);
-		if (!title) continue;
-		dataRows.push({ title, path });
-		if (seasonFromEpisodes) {
-			const ensembleEntries = indexEnsembleDataEntry(title, path, files);
-			if (ensembleEntries) ensembleRows.push(...ensembleEntries);
-		}
+		return processed;
+	} finally {
+		if (!captured)
+			for (const lease of operations.values())
+				releaseClientCacheOperation(lease);
 	}
-	await inBatches(dataRows, async (batch) => {
-		await db("data").insert(batch).onConflict("path").merge();
-	});
-	await inBatches(ensembleRows, async (batch) => {
-		await db("ensemble")
-			.insert(batch)
-			.onConflict(["client_host", "path"])
-			.merge();
-	});
-	return dataRows.length;
 }
 
 function indexEnsembleDataEntry(
@@ -197,10 +298,71 @@ function indexEnsembleDataEntry(
 	}));
 }
 
+/**
+ * Compatibility metadata is visible only through enabled ownership or configured unknown roots.
+ * Unary + removes outer TEXT affinity so SQLite can seek the indexed JSON string path.
+ */
+export function enabledDataEntriesQuery(): Knex.QueryBuilder<
+	DataEntry,
+	DataEntry[]
+> {
+	const { dataDirs } = getRuntimeConfig();
+	return db<DataEntry>("data as cache")
+		.select<DataEntry[]>("cache.path", "cache.title")
+		.where((builder) => {
+			if (!dataDirs.length) {
+				builder.whereRaw("0");
+				return;
+			}
+			builder.whereExists(
+				db("source_origin as origin")
+					.join(
+						"source_namespace as namespace",
+						"namespace.id",
+						"origin.namespace_id",
+					)
+					.select(db.raw("1"))
+					.where("namespace.type", "data-root")
+					.where("namespace.enabled", 1)
+					.whereIn("namespace.locator", dataDirs)
+					.where("origin.state", "verified")
+					.whereRaw(
+						"json_extract(origin.metadata,'$.path')=+cache.path",
+					),
+			);
+			builder.orWhere((unknown) => {
+				unknown.whereNotExists(
+					db("source_origin as origin")
+						.join(
+							"source_namespace as namespace",
+							"namespace.id",
+							"origin.namespace_id",
+						)
+						.select(db.raw("1"))
+						.where("namespace.type", "data-root")
+						.whereRaw(
+							"json_extract(origin.metadata,'$.path')=+cache.path",
+						),
+				);
+				unknown.andWhere((paths) => {
+					for (const configured of dataDirs) {
+						const root = configured.replace(/\/+$/, "");
+						paths
+							.orWhere("cache.path", root)
+							.orWhereRaw("substr(cache.path,1,?)=?", [
+								root.length + 1,
+								`${root}${sep}`,
+							]);
+					}
+				});
+			});
+		});
+}
+
 export async function getDataByFuzzyName(
 	stem: string,
 ): Promise<SearcheeWithoutInfoHash[]> {
-	const allDataEntries: DataEntry[] = await db("data");
+	const allDataEntries: DataEntry[] = await enabledDataEntriesQuery();
 	const fullMatch = createKeyTitle(stem);
 
 	// Attempt to filter torrents in DB to match incoming data before fuzzy check
@@ -233,10 +395,7 @@ export async function getDataByFuzzyName(
 		},
 	);
 
-	await inBatches(entriesToDelete, async (batch) => {
-		await db("data").whereIn("path", batch).del();
-		await db("ensemble").whereIn("path", batch).del();
-	});
+	void entriesToDelete;
 	return (
 		await mapAsync(potentialMatches, (dbData) =>
 			createSearcheeFromPath(dbData.path),

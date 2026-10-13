@@ -318,6 +318,30 @@ describe.sequential("real health adapters and disposable linking", () => {
 		await caller.refresh();
 	});
 
+	it("invalidates warmed health after a scoped refresh moves the save path", async () => {
+		savePath = source;
+		await client.getClientSearchees();
+		await caller.refresh();
+		savePath = join(root, "scoped-missing-source");
+		try {
+			const refreshed = await client.refreshOne("a".repeat(40));
+			expect(refreshed?.savePath).toBe(savePath);
+			const snapshot = await caller.get();
+			expect(snapshot.problems).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						id: `client:linking-test-failed:qbittorrent@fixture:${savePath}`,
+						severity: "warning",
+					}),
+				]),
+			);
+		} finally {
+			savePath = source;
+			await client.refreshOne("a".repeat(40));
+			await caller.refresh();
+		}
+	});
+
 	it("preserves cross-platform linking problem identity and severity", async () => {
 		savePath =
 			process.platform === "win32" ? "/downloads" : "Z:\\downloads";

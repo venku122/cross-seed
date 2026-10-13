@@ -1,7 +1,7 @@
 # Source consistency and root performance repair
 
-Status: concrete architecture proposal for review. Confirmation is complete; new
-product code and production migration have not started.
+Status: approved for local implementation on 2026-10-13. Source/cache repairs
+and isolated tests are underway. Production migration has not been performed.
 
 ## Goal and boundaries
 

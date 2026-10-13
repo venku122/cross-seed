@@ -17,6 +17,7 @@ import removeUrlUniqueConstraint from "./15-remove-url-unique-constraint.js";
 import pruneInactiveIndexers from "./16-prune-inactive-indexers.js";
 import apiKeySettingsJson from "./17-api-key-settings-json.js";
 import ensembleLookupIndex from "./18-ensemble-lookup-index.js";
+import sourceOwnership from "./19-source-ownership.js";
 
 import { Knex } from "knex";
 type Migration = {
@@ -47,6 +48,7 @@ export const migrations = {
 			pruneInactiveIndexers,
 			apiKeySettingsJson,
 			ensembleLookupIndex,
+			sourceOwnership,
 		]),
 	getMigrationName: (migration: Migration) => migration.name,
 	getMigration: (migration: Migration) => Promise.resolve(migration),

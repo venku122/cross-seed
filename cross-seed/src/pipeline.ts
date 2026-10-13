@@ -1,3 +1,5 @@
+import { sourceMembershipQuery } from "./sourceStore.js";
+import { recordPerformance } from "./performanceTelemetry.js";
 import chalk from "chalk";
 import { stat } from "fs/promises";
 import { humanReadableSize } from "@cross-seed/shared/utils";
@@ -77,7 +79,6 @@ import {
 	formatAsList,
 	getLogString,
 	humanReadableDate,
-	inBatches,
 	isTruthy,
 	mapAsync,
 	Mutex,
@@ -446,18 +447,16 @@ async function getEnsembleForCandidate(
 	const candidateLog = `${chalk.bold.white(candidate.name)} from ${candidate.tracker}`;
 	const { ensembleTitles, keyTitles, season } = seasonKeys;
 	const keys = keyTitles.map((keyTitle) => `${keyTitle}.${season}`);
-	const ensemble = await db<{
-		client_host: string | null;
-		path: string;
-		info_hash: string | null;
-		ensemble: string;
-		element: string;
-	}>("ensemble")
-		.whereIn("ensemble", keys)
-		// Suppress only exact memberships before filesystem checks. Preserve the
-		// first row's source order across aliases, hosts, hashes and episodes.
-		.groupBy("client_host", "path", "info_hash", "ensemble", "element")
-		.orderByRaw("MIN(rowid)");
+	const ensemble = await sourceMembershipQuery(db)
+		.whereIn("m.ensemble", keys)
+		.orderBy("m.selection_order");
+	// Membership uniqueness is enforced at publication; clean lookups need no
+	// query-side GROUP BY or temporary aggregate sort.
+	recordPerformance({
+		operation: "ensemble-lookup",
+		durationMs: 0,
+		ensembleRows: ensemble.length,
+	});
 	if (ensemble.length === 0) {
 		logger.verbose({
 			label: searcheeLabel,
@@ -466,7 +465,6 @@ async function getEnsembleForCandidate(
 		return null;
 	}
 	const duplicateFiles = new Set<string>();
-	const entriesToDelete = new Set<string>();
 	const hosts = new Map<string, number>();
 	const filesWithElement = await reduceAsync<
 		(typeof ensemble)[number],
@@ -476,7 +474,6 @@ async function getEnsembleForCandidate(
 		async (acc, entry) => {
 			const path = entry.path;
 			if (await notExists(path)) {
-				entriesToDelete.add(path);
 				return acc;
 			}
 			const length = (await stat(path)).size;
@@ -494,10 +491,9 @@ async function getEnsembleForCandidate(
 		},
 		[],
 	);
-	await inBatches(Array.from(entriesToDelete), async (batch) => {
-		await db("data").whereIn("path", batch).del();
-		await db("ensemble").whereIn("path", batch).del();
-	});
+	// A missing lookup path alone cannot establish a healthy mount or a safe
+	// deletion revision. Dedicated source reconciliation owns cache removal.
+
 	if (filesWithElement.length === 0) {
 		logger.verbose({
 			label: searcheeLabel,

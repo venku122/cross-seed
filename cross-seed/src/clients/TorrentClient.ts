@@ -1,3 +1,7 @@
+import {
+	ClientCacheConcurrencyError,
+	restartClientCachePublication,
+} from "../clientCachePublication.js";
 import ms from "ms";
 import path from "path";
 import { isDeepStrictEqual } from "util";
@@ -167,13 +171,15 @@ export function clientsAreUnique(torrentClients: string[]): {
 
 export function instantiateDownloadClients() {
 	const { torrentClients } = getRuntimeConfig();
-	const { uniqueHosts } = clientsAreUnique(torrentClients);
 	for (const [priority, clientEntryRaw] of torrentClients.entries()) {
 		const { clientType, readonly, url } = parseClientEntry(clientEntryRaw)!;
 		const urlObj = new URL(url);
-		const clientHost = uniqueHosts
-			? urlObj.host
-			: `${urlObj.host}${urlObj.pathname}`;
+		// A configured proxy endpoint keeps its identity when another client is
+		// added. Root endpoints retain the existing host-only label.
+		const pathname = urlObj.pathname
+			.replace(/\/+/g, "/")
+			.replace(/\/$/, "");
+		const clientHost = `${urlObj.host}${pathname}`;
 		switch (clientType) {
 			case Label.QBITTORRENT:
 				activeClients.push(
@@ -200,6 +206,8 @@ export function instantiateDownloadClients() {
 }
 
 export function reloadDownloadClients() {
+	// Late responses from the previous endpoint configuration cannot publish.
+	restartClientCachePublication();
 	activeClients.length = 0;
 	instantiateDownloadClients();
 	invalidateHealth();
@@ -247,11 +255,22 @@ export async function refreshClientSearchee(
 	infoHash: string,
 ): Promise<SearcheeClient | undefined> {
 	if (client.refreshOne) return client.refreshOne(infoHash);
-	const result = await client.getClientSearchees({
-		newSearcheesOnly: true,
-		refresh: [infoHash],
-	});
-	return result.newSearchees.find((s) => s.infoHash === infoHash);
+	for (let attempt = 0; attempt < 3; attempt++) {
+		try {
+			const result = await client.getClientSearchees({
+				newSearcheesOnly: true,
+				refresh: [infoHash],
+			});
+			return result.newSearchees.find((s) => s.infoHash === infoHash);
+		} catch (error) {
+			if (
+				!(error instanceof ClientCacheConcurrencyError) ||
+				attempt === 2
+			)
+				throw error;
+		}
+	}
+	throw new ClientCacheConcurrencyError();
 }
 
 export function organizeTrackers(trackers: Tracker[]): string[] {
