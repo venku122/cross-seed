@@ -17,8 +17,15 @@ export interface SourceOrigin {
 export interface SourceMembership {
 	path: string;
 	ensemble: string;
-	element: string;
+	element: string | number;
 	selectionOrder?: number;
+}
+
+/** Match legacy SQLite TEXT affinity for numeric episode bindings; retain literal strings. */
+export function normalizeSourceElement(element: string | number): string {
+	return typeof element === "number" && Number.isInteger(element)
+		? `${element}.0`
+		: String(element);
 }
 export interface SourcePublication {
 	originId: string;
@@ -231,22 +238,21 @@ export async function replaceSourcePublication(
 				.select("id", "path");
 			for (const path of paths) pathIds.set(path.path, path.id);
 		}
-		const members = publication.memberships.map((member) => ({
-			origin_id: publication.originId,
-			path_id: pathIds.get(member.path)!,
-			ensemble: member.ensemble,
-			element: String(member.element),
-			selection_order:
-				orders.get(
-					JSON.stringify([
-						member.path,
-						member.ensemble,
-						member.element,
-					]),
-				) ??
-				member.selectionOrder ??
-				nextOrder++,
-		}));
+		const members = publication.memberships.map((member) => {
+			const element = normalizeSourceElement(member.element);
+			return {
+				origin_id: publication.originId,
+				path_id: pathIds.get(member.path)!,
+				ensemble: member.ensemble,
+				element,
+				selection_order:
+					orders.get(
+						JSON.stringify([member.path, member.ensemble, element]),
+					) ??
+					member.selectionOrder ??
+					nextOrder++,
+			};
+		});
 		for (let offset = 0; offset < members.length; offset += 150) {
 			await trx("ensemble_membership")
 				.insert(members.slice(offset, offset + 150))

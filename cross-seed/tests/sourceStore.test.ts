@@ -100,6 +100,113 @@ it("keeps credentials out of identity and pathname and namespace type in identit
 	).not.toBe(a);
 });
 
+it("keeps numeric legacy and newly generated episodes in the same element group", async () => {
+	await db("ensemble").insert([
+		{ path: "/legacy/episode", ensemble: "show.S1", element: 1 },
+		{ path: "/legacy/literal", ensemble: "literal", element: "1" },
+	]);
+	const migration = (await import("../src/migrations/19-source-ownership.js"))
+		.default;
+	await migration.up(db);
+	expect(await db("ensemble").orderBy("rowid").pluck("element")).toEqual([
+		"1.0",
+		"1",
+	]);
+	const { getDefaultRuntimeConfig } = await import("../src/configuration.js");
+	const { setRuntimeConfig } = await import("../src/runtimeConfig.js");
+	setRuntimeConfig({
+		...getDefaultRuntimeConfig(),
+		torrentDir: "/fixture/torrents",
+	});
+	const { writeEnsembleTorrentEntries } =
+		await import("../src/ensembleWriter.js");
+	await writeEnsembleTorrentEntries(
+		[
+			{
+				infoHash: "new",
+				name: "Show.S01E01",
+				title: "Show.S01E01",
+				length: 1,
+				files: [{ name: "episode", path: "episode", length: 1 }],
+				torrentFilePath: "/fixture/torrents/episode.torrent",
+			},
+		],
+		() =>
+			Promise.resolve([
+				{
+					client_host: null,
+					info_hash: "new",
+					path: "/new/episode",
+					ensemble: "show.S1",
+					element: 1,
+				},
+			]),
+	);
+	const { sourceMembershipQuery } = await import("../src/sourceStore.js");
+	const mixed = await sourceMembershipQuery(db).where(
+		"m.ensemble",
+		"show.S1",
+	);
+	expect(mixed).toHaveLength(2);
+	expect(new Set(mixed.map((row) => row.element))).toEqual(new Set(["1.0"]));
+	expect(
+		await db("ensemble_membership")
+			.where("ensemble", "literal")
+			.pluck("element"),
+	).toEqual(["1"]);
+});
+
+it("retains numeric membership selection order while preserving literal string elements", async () => {
+	const {
+		ensureSourceNamespace,
+		resolveSourceOrigin,
+		replaceSourcePublication,
+	} = await import("../src/sourceStore.js");
+	const namespace = await ensureSourceNamespace(db, "data-root", "/fixture");
+	const origin = await resolveSourceOrigin(db, namespace, "episode");
+	await replaceSourcePublication(db, {
+		originId: origin.id,
+		expectedRevision: 0,
+		revision: 1,
+		status: "verified",
+		metadata: {},
+		memberships: [
+			{
+				path: "/episode",
+				ensemble: "show.S1",
+				element: "1.0",
+				selectionOrder: 7,
+			},
+			{
+				path: "/episode",
+				ensemble: "show.S1",
+				element: "1",
+				selectionOrder: 9,
+			},
+		],
+	});
+	await replaceSourcePublication(db, {
+		originId: origin.id,
+		expectedRevision: 1,
+		revision: 2,
+		status: "verified",
+		metadata: {},
+		memberships: [
+			{ path: "/episode", ensemble: "show.S1", element: 1 },
+			{ path: "/episode", ensemble: "show.S1", element: "1" },
+		],
+	});
+	expect(
+		await db("ensemble_membership")
+			.where("origin_id", origin.id)
+			.orderBy("selection_order")
+			.select("element", "selection_order"),
+	).toEqual([
+		{ element: "1.0", selection_order: 7 },
+		{ element: "1", selection_order: 9 },
+	]);
+});
+
 it("replaces only one owner atomically, resolves aliases per client, and rejects stale revisions", async () => {
 	const {
 		ensureSourceNamespace,

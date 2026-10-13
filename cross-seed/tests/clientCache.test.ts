@@ -858,7 +858,10 @@ describe.sequential("cache transaction publication", () => {
 		const members = await db("ensemble_membership")
 			.join("physical_path", "path_id", "physical_path.id")
 			.select("path", "element");
-		expect(members).toContainEqual({ path: "/fixture/file", element: "1" });
+		expect(members).toContainEqual({
+			path: "/fixture/file",
+			element: "1.0",
+		});
 	});
 
 	it("invalidates health for a committed batch even if a later SQL batch fails", async () => {

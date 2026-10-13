@@ -48,6 +48,7 @@ import {
 	resolveSourceOrigin,
 	replaceSourcePublication,
 	tombstoneSourceOrigin,
+	normalizeSourceElement,
 } from "./sourceStore.js";
 import { createEnsemblePieces, parseTorrentWithMetadata } from "./torrent.js";
 import {
@@ -732,7 +733,9 @@ export async function upsertSearcheeClientDB(
 													piece.largestFile.path,
 												),
 												ensemble: piece.key,
-												element: String(piece.element),
+												element: normalizeSourceElement(
+													piece.element,
+												),
 											})) ?? [],
 									});
 								if (!published)

@@ -10,6 +10,7 @@ import {
 	ensureSourceNamespace,
 	resolveSourceOrigin,
 	replaceSourcePublication,
+	normalizeSourceElement,
 	type SourceOrigin,
 } from "./sourceStore.js";
 import {
@@ -86,7 +87,7 @@ export async function writeEnsembleTorrentEntries(
 				const memberships = result.value.map((m) => ({
 					path: m.path,
 					ensemble: m.ensemble,
-					element: String(m.element),
+					element: normalizeSourceElement(m.element),
 				}));
 				try {
 					complete =

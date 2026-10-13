@@ -12,6 +12,7 @@ import {
 	ensureSourceNamespace,
 	resolveSourceOrigin,
 	replaceSourcePublication,
+	normalizeSourceElement,
 	type SourceOrigin,
 } from "./sourceStore.js";
 import {
@@ -252,7 +253,9 @@ export async function indexDataPaths(
 										memberships: memberships.map((m) => ({
 											path: m.path,
 											ensemble: m.ensemble,
-											element: String(m.element),
+											element: normalizeSourceElement(
+												m.element,
+											),
 										})),
 										status: "verified",
 									}))
