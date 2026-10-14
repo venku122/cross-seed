@@ -138,7 +138,10 @@ export async function resolveSourceOrigin(
 					.update({ origin_id: id });
 				await trx("source_origin")
 					.where({ id: losing.id })
-					.update({ state: "superseded" });
+					.update({
+						state: "superseded",
+						revision: trx.raw("revision+1"),
+					});
 			}
 		}
 		if (!ids.size)
@@ -285,7 +288,10 @@ export async function replaceSourcePublication(
 					.delete();
 				await trx("source_origin")
 					.where({ id: origin.id })
-					.update({ state: "superseded" });
+					.update({
+						state: "superseded",
+						revision: trx.raw("revision+1"),
+					});
 			}
 		}
 		return true;

@@ -862,3 +862,50 @@ it("seeks compatibility paths by namespace rather than scanning its source metad
 		);
 	}
 });
+
+it("rejects a publication prepared before its origin was superseded by authoritative aliases", async () => {
+	const {
+		ensureSourceNamespace,
+		resolveSourceOrigin,
+		replaceSourcePublication,
+	} = await import("../src/sourceStore.js");
+	const ns = await ensureSourceNamespace(db, "client", "superseded-cas");
+	const first = await resolveSourceOrigin(db, ns, "first");
+	const second = await resolveSourceOrigin(db, ns, "second");
+	for (const origin of [first, second])
+		expect(
+			await replaceSourcePublication(db, {
+				originId: origin.id,
+				expectedRevision: 0,
+				revision: 1,
+				status: "verified",
+				metadata: {
+					clientHost: "superseded-cas",
+					infoHash: origin.source_key,
+				},
+				memberships: [
+					{
+						path: "/fixture/" + origin.source_key,
+						ensemble: "fixture",
+						element: 1,
+					},
+				],
+			}),
+		).toBe(true);
+	await resolveSourceOrigin(db, ns, "first", ["second"], {
+		authoritativeAliases: true,
+	});
+	expect(
+		await replaceSourcePublication(db, {
+			originId: second.id,
+			expectedRevision: 1,
+			revision: 2,
+			status: "verified",
+			metadata: { name: "stale" },
+			memberships: [{ path: "/stale", ensemble: "stale", element: 1 }],
+		}),
+	).toBe(false);
+	expect(
+		await db("ensemble_membership").where({ origin_id: second.id }),
+	).toHaveLength(0);
+});
