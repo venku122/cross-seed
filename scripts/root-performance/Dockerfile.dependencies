@@ -1,0 +1,13 @@
+# Isolated Linux dependencies only: context contains lock/workspace manifests.
+# Borrow an existing local Node26 runtime layer; verify exact runtime below.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+WORKDIR /opt/root-performance/dependencies
+COPY manifests/ ./
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false
+RUN test "$(node -p 'process.version')" = v26.11.1 \
+ && npm ci --workspaces --include-workspace-root --ignore-scripts --no-audit --no-fund \
+ && node -e "const f=require('fs'),c=require('crypto');console.log('DEPENDENCY_LOCK '+c.createHash('sha256').update(f.readFileSync('package-lock.json')).digest('hex'))"
+ENTRYPOINT ["node"]
+CMD ["--version"]

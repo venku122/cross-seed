@@ -1,0 +1,100 @@
+# REVIEW TEMPLATE ONLY. Root owns deployment; no published ports/Docker socket.
+services:
+    fixture:
+        image: ${BENCH_IMAGE:?reviewed amd64 benchmark source image required}
+        entrypoint:
+            [
+                node,
+                /opt/root-performance/dependencies/scripts/root-performance/zfs/snapshot-fixture.mjs,
+            ]
+        read_only: true
+        tmpfs: [/tmp]
+        environment:
+            RPC_DELAY_MS: ${RPC_DELAY_MS:-0}
+            SNAPSHOT_DB: ${SNAPSHOT_DB:-/snapshot/cross-seed.db}
+            PRIVATE_CONFIG: ${PRIVATE_CONFIG:-/snapshot/benchmark-config.json}
+        volumes:
+            - snapshot:/snapshot:ro
+            - results:/private-input:ro
+        healthcheck:
+            test:
+                [
+                    CMD,
+                    node,
+                    --eval,
+                    "fetch('http://127.0.0.1:4041/bench/stats').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+                ]
+            interval: 1s
+            retries: 120
+        networks: [benchmark]
+    controller:
+        image: ${BENCH_IMAGE:?reviewed amd64 benchmark source image required}
+        entrypoint:
+            [
+                node,
+                /opt/root-performance/dependencies/scripts/root-performance/zfs/controller.mjs,
+            ]
+        read_only: true
+        environment:
+            RUN_ID: ${RUN_ID:?fresh fixed run id required}
+            PING_RATE: ${PING_RATE:-200}
+            PING_TIMEOUT: ${PING_TIMEOUT:-2000}
+            RUN_TIMEOUT_MS: ${RUN_TIMEOUT_MS:-180000}
+        volumes:
+            - results:/results
+        healthcheck:
+            test:
+                [
+                    CMD,
+                    node,
+                    --eval,
+                    "fetch('http://127.0.0.1:4042/bench/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+                ]
+            interval: 1s
+            retries: 120
+        networks: [benchmark]
+    daemon:
+        image: ${BENCH_IMAGE:?reviewed amd64 benchmark source image required}
+        entrypoint:
+            [
+                sh,
+                /opt/root-performance/dependencies/scripts/root-performance/zfs/entrypoint.sh,
+            ]
+        read_only: true
+        # SQLite can spill DISTINCT/ORDER BY validation into temporary files.
+        # These bytes remain inside the daemon's existing memory cap.
+        tmpfs: [/tmp:size=256m,mode=1777]
+        mem_limit: 2g
+        memswap_limit: 2g
+        pids_limit: 128
+        environment:
+            RUN_ID: ${RUN_ID:?fresh fixed run id required}
+            CROSS_SEED_SQLITE_WORKER: ${CANDIDATE_WORKER:-0}
+            BENCH_PROFILE: ${BENCH_PROFILE:-0}
+            BENCH_OPERATIONS: ${BENCH_OPERATIONS:-1}
+            RPC_DELAY_MS: ${RPC_DELAY_MS:-0}
+            SNAPSHOT_DB: ${SNAPSHOT_DB:-/snapshot/cross-seed.db}
+            PRIVATE_CONFIG: ${PRIVATE_CONFIG:-/snapshot/benchmark-config.json}
+        volumes:
+            - snapshot:/snapshot:ro
+            - results:/private-input:ro
+            - results:/results
+            - ${MEDIA_ROOT_ON_HOST:?reviewed media root
+              required}:${MEDIA_ROOT_IN_DAEMON:?must match snapshot lexical
+              paths}:ro
+        depends_on:
+            fixture:
+                condition: service_healthy
+            controller:
+                condition: service_healthy
+        networks: [benchmark]
+networks:
+    benchmark:
+        internal: true
+volumes:
+    snapshot:
+        external: true
+        name:
+            ${SNAPSHOT_VOLUME:?existing reviewed cold snapshot volume required}
+    results:
+        name: ${RESULTS_VOLUME:?new isolated results volume required}

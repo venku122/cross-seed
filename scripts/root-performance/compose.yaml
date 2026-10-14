@@ -1,0 +1,30 @@
+# Linux-only capped worker template. Start fixture/control on host separately.
+# Fixture generation and load generation are NOT services in this project.
+services:
+    daemon-worker:
+        image: ${BENCH_NODE_IMAGE:-node:26.11.1-bookworm-slim}
+        network_mode: host
+        mem_limit: 2g
+        memswap_limit: 2g # total memory+swap = memory, therefore swap is disabled
+        pids_limit: 128
+        environment:
+            QB_ORIGIN: ${QB_ORIGIN:?external fixture origin required}
+            LOAD_CONTROL: ${LOAD_CONTROL:?external load-control origin required}
+            BENCH_FILES: ${BENCH_FILES:-1}
+            BENCH_CLIENTS: 1
+            BENCH_SOURCE_DELAY: 0
+        volumes:
+            - ${BENCH_CHECKOUT:?compiled checkout required}:${BENCH_CHECKOUT}:ro
+            - ${BENCH_HARNESS_DIR:?harness directory
+              required}:${BENCH_HARNESS_DIR}:ro
+        command:
+            [
+                node,
+                "${BENCH_WORKER:?generated pinned worker required}",
+                "${BENCH_CHECKOUT}",
+                "${BENCH_COUNT:-8194}",
+                "1",
+                "0",
+                "1",
+                refresh,
+            ]

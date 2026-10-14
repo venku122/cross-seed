@@ -1,0 +1,18 @@
+ARG DEPENDENCY_IMAGE
+FROM ${DEPENDENCY_IMAGE}
+USER root
+WORKDIR /opt/root-performance/dependencies
+RUN node -e "require('fs').writeFileSync('/tmp/dependency-lock-hash',require('crypto').createHash('sha256').update(require('fs').readFileSync('package-lock.json')).digest('hex'))"
+COPY source/ ./
+COPY harness/ ./
+COPY dependency-aliases.json /tmp/dependency-aliases.json
+RUN node scripts/root-performance/zfs/install-dependency-aliases.mjs /tmp/dependency-aliases.json \
+ && test "$(node -p 'process.version')" = v26.11.1 \
+ && node -e "const f=require('fs'),c=require('crypto');if(c.createHash('sha256').update(f.readFileSync('package-lock.json')).digest('hex')!==f.readFileSync('/tmp/dependency-lock-hash','utf8'))throw Error('Source/dependency lock mismatch')" \
+ && node node_modules/typescript/bin/tsc -b cross-seed/tsconfig.build.json --force \
+ && cp -a /usr/src/cross-seed/cross-seed/dist/webui cross-seed/dist/webui \
+ && chmod a+rx scripts cross-seed shared api-types webui cross-seed.org \
+ && chmod -R a+rX scripts cross-seed/dist shared/dist
+# Runner supplies sh -c; do not inherit the dependency image's node entrypoint.
+ENTRYPOINT []
+CMD ["node", "--version"]
