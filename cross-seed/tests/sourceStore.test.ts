@@ -909,3 +909,62 @@ it("rejects a publication prepared before its origin was superseded by authorita
 		await db("ensemble_membership").where({ origin_id: second.id }),
 	).toHaveLength(0);
 });
+
+it("seeks cleanup paths by their physical path index and checks visibility per path", async () => {
+	const {
+		sourceMembershipPathsQuery,
+		ensureSourceNamespace,
+		resolveSourceOrigin,
+		replaceSourcePublication,
+	} = await import("../src/sourceStore.js");
+	const ns = await ensureSourceNamespace(db, "client", "path-query");
+	for (const [key, path] of [
+		["a", "/a"],
+		["b", "/b"],
+		["c", "/shared"],
+	]) {
+		const origin = await resolveSourceOrigin(db, ns, key);
+		await replaceSourcePublication(db, {
+			originId: origin.id,
+			expectedRevision: 0,
+			revision: 1,
+			status: "verified",
+			metadata: { clientHost: "path-query", infoHash: key },
+			memberships: [{ path, ensemble: "show", element: 1 }],
+		});
+	}
+	const query = sourceMembershipPathsQuery(db)
+		.where("path", ">", "/a")
+		.orderBy("path")
+		.limit(512);
+	expect(await query).toEqual([{ path: "/b" }, { path: "/shared" }]);
+	const sql = query.toSQL();
+	const plan = await db.raw<{ detail: string }[]>(
+		"EXPLAIN QUERY PLAN " + sql.sql,
+		sql.bindings,
+	);
+	expect(
+		plan.some(
+			(row) =>
+				row.detail.includes("physical_path") &&
+				row.detail.includes("path>?"),
+		),
+	).toBe(true);
+	const oldQuery = db()
+		.from(
+			(await import("../src/sourceStore.js"))
+				.sourceMembershipQuery(db)
+				.as("memberships"),
+		)
+		.distinct("path")
+		.where("path", ">", "/a")
+		.orderBy("path")
+		.limit(512);
+	const oldSql = oldQuery.toSQL();
+	const oldPlan = await db.raw<{ detail: string }[]>(
+		"EXPLAIN QUERY PLAN " + oldSql.sql,
+		oldSql.bindings,
+	);
+	expect(await oldQuery).toEqual(await query);
+	expect(oldPlan.length).toBeGreaterThan(0);
+});

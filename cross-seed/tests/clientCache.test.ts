@@ -305,6 +305,23 @@ function publicationFixture(host: string, hash: string): SearcheeClient {
 	};
 }
 describe.sequential("cache transaction publication", () => {
+	it("creates 100 isolated client origins without per-source SQL transactions", async () => {
+		const values = Array.from({ length: 100 }, (_, i) =>
+			publicationFixture("bulk-new", String(i)),
+		);
+		queries.splice(0);
+		expect(await upsertSearcheeClientDB(values)).toBe(true);
+		expect(queries.length).toBeLessThanOrEqual(35);
+		expect(
+			await db("source_origin")
+				.whereRaw("json_extract(metadata,'$.clientHost')=?", [
+					"bulk-new",
+				])
+				.count({ n: "*" })
+				.first(),
+		).toEqual({ n: 100 });
+	});
+
 	it("publishes 100 existing client origins with bounded SQL and no duplicated file metadata", async () => {
 		const { setRuntimeConfig } = await import("../src/runtimeConfig.js");
 		const { getDefaultRuntimeConfig } =
@@ -344,6 +361,13 @@ describe.sequential("cache transaction publication", () => {
 		expect(await upsertSearcheeClientDB(values)).toBe(true);
 		const publicationQueries = queries.length;
 		expect(publicationQueries).toBeLessThanOrEqual(30);
+		expect(
+			queries.some((sql) =>
+				/^(delete from|insert into) [`"]?ensemble_membership/i.test(
+					sql.sql,
+				),
+			),
+		).toBe(false);
 		const after = await db("ensemble_membership")
 			.whereIn(
 				"origin_id",

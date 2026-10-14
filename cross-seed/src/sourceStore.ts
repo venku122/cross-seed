@@ -384,3 +384,56 @@ export async function findSourceOrigin(
 				.whereNot("state", "superseded")
 				.first();
 }
+
+/** Seek physical paths first; source visibility is an indexed existence check. */
+export function sourceMembershipPathsQuery(
+	db: Knex,
+): Knex.QueryBuilder<{ path: string }, { path: string }[]> {
+	return db<{ path: string }>("physical_path as path")
+		.select<{ path: string }[]>("path.path as path")
+		.whereExists(
+			db("ensemble_membership as member")
+				.joinRaw(
+					"CROSS JOIN source_origin AS origin ON origin.id=member.origin_id",
+				)
+				.joinRaw(
+					"CROSS JOIN source_namespace AS namespace ON namespace.id=origin.namespace_id",
+				)
+				.select(db.raw("1"))
+				.whereRaw("member.path_id=path.id")
+				.where("namespace.enabled", 1)
+				.where("origin.visible", 1)
+				.whereIn("origin.state", ["verified", "legacy-unknown"]),
+		);
+}
+
+/** Cleanup captures only owner revisions, seeking the observed physical paths first. */
+export function observedSourceRevisions(
+	db: Knex,
+	paths: string[],
+): Knex.QueryBuilder<
+	{ path: string; origin_id: string; revision: number },
+	{ path: string; origin_id: string; revision: number }[]
+> {
+	return db<{ path: string; origin_id: string; revision: number }>(
+		"physical_path as path",
+	)
+		.joinRaw(
+			"CROSS JOIN ensemble_membership AS member ON member.path_id=path.id",
+		)
+		.joinRaw(
+			"CROSS JOIN source_origin AS origin ON origin.id=member.origin_id",
+		)
+		.joinRaw(
+			"CROSS JOIN source_namespace AS namespace ON namespace.id=origin.namespace_id",
+		)
+		.whereIn("path.path", paths)
+		.where("namespace.enabled", 1)
+		.where("origin.visible", 1)
+		.whereIn("origin.state", ["verified", "legacy-unknown"])
+		.select<{ path: string; origin_id: string; revision: number }[]>(
+			"path.path as path",
+			"member.origin_id",
+			"origin.revision",
+		);
+}

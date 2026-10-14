@@ -4,8 +4,8 @@ import {
 	recordPerformance,
 } from "./performanceTelemetry.js";
 import {
-	sourceMembershipQuery,
-	type SourceMembershipRow,
+	sourceMembershipPathsQuery,
+	observedSourceRevisions,
 } from "./sourceStore.js";
 import { invalidateHealth } from "./healthGeneration.js";
 import { access, unlink } from "fs/promises";
@@ -169,16 +169,9 @@ async function pruneMissingCachedPaths(
 					? db<{ path: string }>("data")
 							.select<{ path: string }[]>("path")
 							.whereNotNull("path")
-					: db<{ path: string }>()
-							.from(sourceMembershipQuery(db).as("memberships"))
-							.select<{ path: string }[]>("path");
+					: sourceMembershipPathsQuery(db);
 			if (lastPath !== undefined) query.where("path", ">", lastPath);
-			// Both SQL branches select exactly one path. Knex's aliased
-			// subquery overload loses that record type at this boundary.
-			return query as unknown as Knex.QueryBuilder<
-				{ path: string },
-				{ path: string }[]
-			>;
+			return query;
 		};
 		const query = dataDirs.length
 			? pathsFrom("data")
@@ -193,14 +186,10 @@ async function pruneMissingCachedPaths(
 		lastPath = page[page.length - 1].path;
 		// Capture revisions before filesystem awaits. A watcher or refresh that
 		// publishes during the probe keeps its new source visible.
-		const observed = await sourceMembershipQuery(db)
-			.whereIn(
-				"p.path",
-				page.map((row) => row.path),
-			)
-			.select<Array<SourceMembershipRow & { revision: number }>>(
-				"o.revision",
-			);
+		const observed = await observedSourceRevisions(
+			db,
+			page.map((row) => row.path),
+		);
 		let uncertainPaths = 0;
 		const missingPaths: string[] = [];
 		await inBatches(

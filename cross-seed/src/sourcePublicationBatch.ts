@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Knex } from "knex";
 import {
 	normalizeSourceElement,
@@ -5,7 +6,7 @@ import {
 	type SourceOrigin,
 } from "./sourceStore.js";
 
-/** Only existing, fully bound equivalences qualify; creation and alias merging use the strict resolver. */
+/** Existing equivalences and isolated new keys qualify; ambiguous aliases use the strict resolver. */
 export async function resolveExistingSourceOrigins(
 	trx: Knex.Transaction,
 	namespace: string,
@@ -26,6 +27,61 @@ export async function resolveExistingSourceOrigins(
 			(SourceOrigin & { alias: string })[]
 		>("origin.*", "alias.alias");
 	const byAlias = new Map(rows.map((row) => [row.alias, row]));
+	const direct = await trx<SourceOrigin>("source_origin")
+		.where("namespace_id", namespace)
+		.whereIn("source_key", keys);
+	const directKeys = new Set(direct.map((origin) => origin.source_key));
+	const uses = new Map<string, number>();
+	for (const source of sources)
+		for (const key of new Set([source.key, ...source.aliases]))
+			uses.set(key, (uses.get(key) ?? 0) + 1);
+	const isolated = sources.filter(
+		(source) =>
+			source.key &&
+			source.aliases.every(Boolean) &&
+			[...new Set([source.key, ...source.aliases])].every(
+				(key) =>
+					uses.get(key) === 1 &&
+					!byAlias.has(key) &&
+					!directKeys.has(key),
+			),
+	);
+	if (isolated.length) {
+		const created: SourceOrigin[] = isolated.map((source) => ({
+			id: createHash("sha256")
+				.update(JSON.stringify([namespace, source.key]))
+				.digest("hex"),
+			namespace_id: namespace,
+			source_key: source.key,
+			revision: 0,
+			state: "unavailable",
+			metadata: "{}",
+		}));
+		for (let offset = 0; offset < created.length; offset += 100)
+			await trx("source_origin").insert(
+				created.slice(offset, offset + 100),
+			);
+		const aliasRows = created.flatMap((origin, index) =>
+			[...new Set([isolated[index].key, ...isolated[index].aliases])].map(
+				(alias) => ({
+					namespace_id: namespace,
+					alias,
+					origin_id: origin.id,
+				}),
+			),
+		);
+		for (let offset = 0; offset < aliasRows.length; offset += 300)
+			await trx("source_alias").insert(
+				aliasRows.slice(offset, offset + 300),
+			);
+		for (let index = 0; index < created.length; index++)
+			for (const key of new Set([
+				isolated[index].key,
+				...isolated[index].aliases,
+			]))
+				byAlias.set(key, { ...created[index], alias: key });
+	}
+
 	const result = new Map<string, SourceOrigin>();
 	const counts = new Map<string, number>();
 	const blocked = new Set<string>();
@@ -36,7 +92,13 @@ export async function resolveExistingSourceOrigins(
 			source.aliases.some((alias) => byAlias.get(alias)?.id !== origin.id)
 		) {
 			for (const key of [source.key, ...source.aliases]) {
-				const bound = byAlias.get(key);
+				const bound =
+					byAlias.get(key) ??
+					direct.find(
+						(candidate) =>
+							candidate.source_key === key &&
+							candidate.state !== "superseded",
+					);
 				if (bound) blocked.add(bound.id);
 			}
 			continue;
@@ -71,28 +133,21 @@ export async function replaceSourcePublicationBatch(
 	)
 		throw new Error("Client source publication revision conflict");
 	const ids = publications.map((p) => p.originId);
-	const cases = publications.map(() => "WHEN ? THEN ?").join(" ");
-	const changed = await trx("source_origin")
-		.where((query) => {
-			for (const p of publications)
-				query.orWhere({ id: p.originId, revision: p.expectedRevision });
-		})
-		.update({
-			revision: trx.raw(
-				`CASE id ${cases} END`,
-				publications.flatMap((p) => [p.originId, p.revision]),
-			),
-			metadata: trx.raw(
-				`CASE id ${cases} END`,
-				publications.flatMap((p) => [
-					p.originId,
-					JSON.stringify(p.metadata),
-				]),
-			),
-			state: "verified",
-		});
-	if (changed !== publications.length)
+
+	const changed = await trx.raw<{ id: string }[]>(
+		`WITH updates(id,expected_revision,next_revision,next_metadata) AS (VALUES ${publications.map(() => "(?,?,?,?)").join(",")})
+   UPDATE source_origin SET revision=updates.next_revision,metadata=updates.next_metadata,state='verified'
+   FROM updates WHERE source_origin.id=updates.id AND source_origin.revision=updates.expected_revision RETURNING source_origin.id`,
+		publications.flatMap((p) => [
+			p.originId,
+			p.expectedRevision,
+			p.revision,
+			JSON.stringify(p.metadata),
+		]),
+	);
+	if (changed.length !== publications.length)
 		throw new Error("Client source publication revision conflict");
+
 	const old = await trx("ensemble_membership as member")
 		.join("physical_path as path", "member.path_id", "path.id")
 		.whereIn("member.origin_id", ids)
@@ -116,55 +171,77 @@ export async function replaceSourcePublicationBatch(
 			row.selection_order,
 		]),
 	);
-	const maximum = await trx("ensemble_membership")
-		.max<{ n: number | null }>({ n: "selection_order" })
-		.first();
-	let nextOrder = (maximum?.n ?? 0) + 1;
-	await trx("ensemble_membership").whereIn("origin_id", ids).delete();
-	const paths = [
-		...new Set(
-			publications.flatMap((p) => p.memberships.map((m) => m.path)),
+
+	const nextTuples = new Set(
+		publications.flatMap((p) =>
+			p.memberships.map((member) =>
+				JSON.stringify([
+					p.originId,
+					member.path,
+					member.ensemble,
+					normalizeSourceElement(member.element),
+				]),
+			),
 		),
-	];
-	for (let offset = 0; offset < paths.length; offset += 200)
-		await trx("physical_path")
-			.insert(paths.slice(offset, offset + 200).map((path) => ({ path })))
-			.onConflict("path")
-			.ignore();
-	const pathIds = new Map<string, number>();
-	for (let offset = 0; offset < paths.length; offset += 400) {
-		const found = await trx<{ id: number; path: string }>("physical_path")
-			.whereIn("path", paths.slice(offset, offset + 400))
-			.select("id", "path");
-		for (const row of found) pathIds.set(row.path, row.id);
-	}
-	const members = publications.flatMap((p) =>
-		p.memberships.map((member) => {
-			const element = normalizeSourceElement(member.element);
-			return {
-				origin_id: p.originId,
-				path_id: pathIds.get(member.path)!,
-				ensemble: member.ensemble,
-				element,
-				selection_order:
-					orders.get(
-						JSON.stringify([
-							p.originId,
-							member.path,
-							member.ensemble,
-							element,
-						]),
-					) ??
-					member.selectionOrder ??
-					nextOrder++,
-			};
-		}),
 	);
-	for (let offset = 0; offset < members.length; offset += 150)
-		await trx("ensemble_membership")
-			.insert(members.slice(offset, offset + 150))
-			.onConflict(["origin_id", "path_id", "ensemble", "element"])
-			.ignore();
+	const unchanged =
+		nextTuples.size === old.length &&
+		[...nextTuples].every((key) => orders.has(key));
+	if (!unchanged) {
+		const maximum = await trx("ensemble_membership")
+			.max<{ n: number | null }>({ n: "selection_order" })
+			.first();
+		let nextOrder = (maximum?.n ?? 0) + 1;
+		await trx("ensemble_membership").whereIn("origin_id", ids).delete();
+		const paths = [
+			...new Set(
+				publications.flatMap((p) => p.memberships.map((m) => m.path)),
+			),
+		];
+		for (let offset = 0; offset < paths.length; offset += 200)
+			await trx("physical_path")
+				.insert(
+					paths.slice(offset, offset + 200).map((path) => ({ path })),
+				)
+				.onConflict("path")
+				.ignore();
+		const pathIds = new Map<string, number>();
+		for (let offset = 0; offset < paths.length; offset += 400) {
+			const found = await trx<{ id: number; path: string }>(
+				"physical_path",
+			)
+				.whereIn("path", paths.slice(offset, offset + 400))
+				.select("id", "path");
+			for (const row of found) pathIds.set(row.path, row.id);
+		}
+		const members = publications.flatMap((p) =>
+			p.memberships.map((member) => {
+				const element = normalizeSourceElement(member.element);
+				return {
+					origin_id: p.originId,
+					path_id: pathIds.get(member.path)!,
+					ensemble: member.ensemble,
+					element,
+					selection_order:
+						orders.get(
+							JSON.stringify([
+								p.originId,
+								member.path,
+								member.ensemble,
+								element,
+							]),
+						) ??
+						member.selectionOrder ??
+						nextOrder++,
+				};
+			}),
+		);
+		for (let offset = 0; offset < members.length; offset += 150)
+			await trx("ensemble_membership")
+				.insert(members.slice(offset, offset + 150))
+				.onConflict(["origin_id", "path_id", "ensemble", "element"])
+				.ignore();
+	}
 	const clients = publications
 		.map(
 			(p) =>
