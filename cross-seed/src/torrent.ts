@@ -627,6 +627,30 @@ export async function reconcileSourceNamespaces(): Promise<void> {
 		"torrent-directory": torrentDir ? [torrentDir] : [],
 	};
 	await db.transaction(async (trx) => {
+		// A reactivated client needs a fresh remote publication. Preserve its
+		// history, but don't treat the last observed endpoint snapshot as live.
+		const reactivated = configured.client.length
+			? await trx<{
+					id: string;
+					type: string;
+					enabled: number;
+					locator: string;
+				}>("source_namespace")
+					.where({ type: "client", enabled: 0 })
+					.whereIn("locator", configured.client)
+					.select("id")
+			: [];
+		if (reactivated.length)
+			await trx("source_origin")
+				.whereIn(
+					"namespace_id",
+					reactivated.map((namespace) => namespace.id),
+				)
+				.where("state", "verified")
+				.update({
+					state: "unavailable",
+					revision: trx.raw("revision+1"),
+				});
 		// Visibility policy does not turn unresolved history into owned sources.
 		// Named historical clients must still be configured; unnamed history is
 		// hidden when there is no configured source that can provide it.

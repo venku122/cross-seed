@@ -356,5 +356,21 @@ it("reconciles live configuration visibility while retaining disabled source sta
 		useClientTorrents: true,
 	});
 	await reconcileSourceNamespaces();
+	expect(await sourceMembershipQuery(db)).toHaveLength(1);
+	expect(await db("ensemble_membership").count({ n: "*" }).first()).toEqual({
+		n: 2,
+	});
+	await upsertSearcheeClientDB([
+		{
+			infoHash: meta.infoHash,
+			name: meta.name,
+			title: meta.name,
+			files: meta.files,
+			length: 100,
+			clientHost: "fixture",
+			savePath: media,
+			trackers: [],
+		},
+	]);
 	expect(await sourceMembershipQuery(db)).toHaveLength(2);
 });

@@ -106,3 +106,52 @@ it("hides a migrated named legacy membership when its client is disabled without
 		1,
 	);
 });
+
+it("requires a live publication after a client endpoint is disabled and reactivated", async () => {
+	const { upsertSearcheeClientDB, updateSearcheeClientDB } =
+		await import("../src/searchee.js");
+	const { getInfoHashesToExclude } = await import("../src/torrent.js");
+	const hash = "a".repeat(40),
+		host = "reactivated.invalid/qb";
+	const source = {
+		infoHash: hash,
+		clientHost: host,
+		name: "Fixture.S01E01.mkv",
+		title: "Fixture.S01E01.mkv",
+		savePath: "/synthetic/a",
+		length: 1,
+		files: [{ name: "file.mkv", path: "file.mkv", length: 1 }],
+		trackers: [],
+	};
+	const settings = {
+		dataDirs: [],
+		useClientTorrents: true,
+		torrentClients: ["qbittorrent:http://reactivated.invalid/qb"],
+	};
+	await caller.save(settings);
+	await upsertSearcheeClientDB([source]);
+	expect((await getInfoHashesToExclude()).has(hash)).toBe(true);
+	await caller.save({
+		...settings,
+		torrentClients: ["qbittorrent:https://reactivated.invalid/qb"],
+	});
+	await updateSearcheeClientDB(host, [], new Set());
+	await caller.save(settings);
+	expect((await getInfoHashesToExclude()).has(hash)).toBe(false);
+	const origin = await db<{ state: string; metadata: string }>(
+		"source_origin",
+	)
+		.whereRaw("json_extract(metadata,'$.infoHash')=?", [hash])
+		.first();
+	expect(origin!.state).toBe("unavailable");
+	expect(
+		await db("ensemble_membership").whereIn(
+			"origin_id",
+			db("source_origin")
+				.whereRaw("json_extract(metadata,'$.infoHash')=?", [hash])
+				.select("id"),
+		),
+	).toHaveLength(1);
+	await upsertSearcheeClientDB([source]);
+	expect((await getInfoHashesToExclude()).has(hash)).toBe(true);
+});
