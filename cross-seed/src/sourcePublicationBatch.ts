@@ -256,16 +256,28 @@ export async function replaceSourcePublicationBatch(
 				typeof p.infoHash === "string",
 		);
 	if (clients.length) {
-		const legacy = await trx("source_origin")
-			.where({ namespace_id: "legacy-unknown", state: "legacy-unknown" })
-			.where((query) => {
-				for (const client of clients)
-					query.orWhereRaw(
-						"json_extract(metadata,'$.clientHost')=? AND json_extract(metadata,'$.infoHash')=?",
-						[client.clientHost, client.infoHash],
-					);
-			})
-			.select<{ id: string }[]>("id");
+		const identities = [
+			...new Map(
+				clients.map((client) => [
+					JSON.stringify([client.clientHost, client.infoHash]),
+					client,
+				]),
+			).values(),
+		];
+		// Keep incoming identities outside the origin scan so SQLite seeks all
+		// four index keys, including the two JSON expressions. An OR list here
+		// otherwise scans every retained legacy data origin for each batch.
+		const legacy = await trx.raw<{ id: string }[]>(
+			`WITH clients(host,hash) AS (VALUES ${identities.map(() => "(?,?)").join(",")})
+SELECT origin.id FROM clients CROSS JOIN source_origin AS origin
+WHERE origin.namespace_id='legacy-unknown' AND origin.state='legacy-unknown'
+AND json_extract(origin.metadata,'$.clientHost')=clients.host
+AND json_extract(origin.metadata,'$.infoHash')=clients.hash`,
+			identities.flatMap((client) => [
+				client.clientHost,
+				client.infoHash,
+			]),
+		);
 		if (legacy.length) {
 			const legacyIds = legacy.map((row) => row.id);
 			for (let offset = 0; offset < legacyIds.length; offset += 400) {

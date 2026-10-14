@@ -305,6 +305,61 @@ function publicationFixture(host: string, hash: string): SearcheeClient {
 	};
 }
 describe.sequential("cache transaction publication", () => {
+	it("retires all exact legacy client origins while preserving other hosts and data sources", async () => {
+		const legacy = [
+			{
+				id: "retirement-client-one",
+				clientHost: "retirement",
+				infoHash: "same",
+			},
+			{
+				id: "retirement-client-two",
+				clientHost: "retirement",
+				infoHash: "same",
+			},
+			{
+				id: "retirement-other-host",
+				clientHost: "other-host",
+				infoHash: "same",
+			},
+			{ id: "retirement-data", clientHost: null, infoHash: null },
+		];
+		await db("source_origin").insert(
+			legacy.map(({ id, clientHost, infoHash }) => ({
+				id,
+				source_key: id,
+				namespace_id: "legacy-unknown",
+				state: "legacy-unknown",
+				metadata: JSON.stringify({ clientHost, infoHash }),
+				revision: 0,
+			})),
+		);
+		expect(
+			await upsertSearcheeClientDB([
+				publicationFixture("retirement", "same"),
+				publicationFixture("retirement", "fresh"),
+			]),
+		).toBe(true);
+		const rows = await db<{ id: string; state: string; revision: number }>(
+			"source_origin",
+		)
+			.whereIn(
+				"id",
+				legacy.map((origin) => origin.id),
+			)
+			.select("id", "state", "revision");
+		const byId = new Map(rows.map((row) => [row.id, row]));
+		for (const id of ["retirement-client-one", "retirement-client-two"])
+			expect(byId.get(id)).toMatchObject({
+				state: "superseded",
+				revision: 1,
+			});
+		for (const id of ["retirement-other-host", "retirement-data"])
+			expect(byId.get(id)).toMatchObject({
+				state: "legacy-unknown",
+				revision: 0,
+			});
+	});
 	it("creates 100 isolated client origins without per-source SQL transactions", async () => {
 		const values = Array.from({ length: 100 }, (_, i) =>
 			publicationFixture("bulk-new", String(i)),
@@ -312,6 +367,30 @@ describe.sequential("cache transaction publication", () => {
 		queries.splice(0);
 		expect(await upsertSearcheeClientDB(values)).toBe(true);
 		expect(queries.length).toBeLessThanOrEqual(35);
+		const legacyLookups = queries.filter(
+			(query) =>
+				query.sql.includes("source_origin") &&
+				query.sql.includes("$.clientHost") &&
+				query.sql.includes("$.infoHash"),
+		);
+		expect(legacyLookups).toHaveLength(1);
+		const lookup = legacyLookups[0];
+		const bindings = (lookup.bindings ?? []).map((value) => {
+			if (typeof value !== "string")
+				throw new Error("Expected string source identity");
+			return value;
+		});
+		const plan = await db.raw<{ detail: string }[]>(
+			`EXPLAIN QUERY PLAN ${lookup.sql}`,
+			bindings,
+		);
+		expect(
+			plan.some(
+				(row) =>
+					row.detail.includes("source_legacy_client_identity") &&
+					row.detail.includes("<expr>=? AND <expr>=?"),
+			),
+		).toBe(true);
 		expect(
 			await db("source_origin")
 				.whereRaw("json_extract(metadata,'$.clientHost')=?", [
