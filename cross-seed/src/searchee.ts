@@ -6,6 +6,10 @@ import {
 	publishClientCacheBatch,
 	type ClientCacheLease,
 } from "./clientCachePublication.js";
+import {
+	resolveExistingSourceOrigins,
+	replaceSourcePublicationBatch,
+} from "./sourcePublicationBatch.js";
 import { readdir, stat } from "fs/promises";
 import { basename, dirname, isAbsolute, join, relative } from "path";
 import ms from "ms";
@@ -49,6 +53,7 @@ import {
 	replaceSourcePublication,
 	tombstoneSourceOrigin,
 	normalizeSourceElement,
+	type SourcePublication,
 } from "./sourceStore.js";
 import { createEnsemblePieces, parseTorrentWithMetadata } from "./torrent.js";
 import {
@@ -694,24 +699,47 @@ export async function upsertSearcheeClientDB(
 								.insert(rows)
 								.onConflict(["client_host", "info_hash"])
 								.merge();
-							for (const searchee of batch.filter((source) =>
+							const sources = batch.filter((source) =>
 								keys.has(source.infoHash),
-							)) {
-								const origin = await resolveSourceOrigin(
+							);
+							const existing = await resolveExistingSourceOrigins(
+								trx,
+								namespace,
+								sources.map((source) => ({
+									key: source.infoHash,
+									aliases:
+										aliases?.get(source.infoHash) ?? [],
+								})),
+							);
+							let pending: SourcePublication[] = [];
+							const flush = async () => {
+								await replaceSourcePublicationBatch(
 									trx,
-									namespace,
-									searchee.infoHash,
-									[
-										...(aliases?.get(searchee.infoHash) ??
-											[]),
-									],
-									{
-										authoritativeAliases: Boolean(
-											aliases?.get(searchee.infoHash)
-												?.length,
-										),
-									},
+									pending,
 								);
+								pending = [];
+							};
+							for (const searchee of sources) {
+								const known = existing.get(searchee.infoHash);
+								if (!known) await flush();
+								const origin =
+									known ??
+									(await resolveSourceOrigin(
+										trx,
+										namespace,
+										searchee.infoHash,
+										[
+											...(aliases?.get(
+												searchee.infoHash,
+											) ?? []),
+										],
+										{
+											authoritativeAliases: Boolean(
+												aliases?.get(searchee.infoHash)
+													?.length,
+											),
+										},
+									));
 								const pieces = getRuntimeConfig()
 									.seasonFromEpisodes
 									? createEnsemblePieces(
@@ -719,30 +747,43 @@ export async function upsertSearcheeClientDB(
 											searchee.files,
 										)
 									: null;
-								const published =
-									await replaceSourcePublication(trx, {
-										originId: origin.id,
-										expectedRevision: origin.revision,
-										revision: origin.revision + 1,
-										metadata: searchee,
-										status: "verified",
-										memberships:
-											pieces?.map((piece) => ({
-												path: join(
-													searchee.savePath,
-													piece.largestFile.path,
-												),
-												ensemble: piece.key,
-												element: normalizeSourceElement(
-													piece.element,
-												),
-											})) ?? [],
-									});
-								if (!published)
+								// Full files/trackers live once in the owner-qualified cache row in this transaction.
+								const publication: SourcePublication = {
+									originId: origin.id,
+									expectedRevision: origin.revision,
+									revision: origin.revision + 1,
+									metadata: {
+										clientHost: searchee.clientHost,
+										infoHash: searchee.infoHash,
+										name: searchee.name,
+										title: searchee.title,
+										savePath: searchee.savePath,
+									},
+									status: "verified",
+									memberships:
+										pieces?.map((piece) => ({
+											path: join(
+												searchee.savePath,
+												piece.largestFile.path,
+											),
+											ensemble: piece.key,
+											element: normalizeSourceElement(
+												piece.element,
+											),
+										})) ?? [],
+								};
+								if (known) pending.push(publication);
+								else if (
+									!(await replaceSourcePublication(
+										trx,
+										publication,
+									))
+								)
 									throw new Error(
 										"Client source publication revision conflict",
 									);
 							}
+							await flush();
 						},
 						knownAliases,
 					);

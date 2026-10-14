@@ -305,6 +305,72 @@ function publicationFixture(host: string, hash: string): SearcheeClient {
 	};
 }
 describe.sequential("cache transaction publication", () => {
+	it("publishes 100 existing client origins with bounded SQL and no duplicated file metadata", async () => {
+		const { setRuntimeConfig } = await import("../src/runtimeConfig.js");
+		const { getDefaultRuntimeConfig } =
+			await import("../src/configuration.js");
+		setRuntimeConfig({
+			...getDefaultRuntimeConfig(),
+			seasonFromEpisodes: 1,
+		});
+		const values = Array.from({ length: 100 }, (_, i) => ({
+			...publicationFixture("bulk-existing", String(i)),
+			name: `Fixture.S01E${String(i + 1).padStart(2, "0")}`,
+			title: `Fixture.S01E${String(i + 1).padStart(2, "0")}`,
+			files: [{ name: "large.mkv", path: `${i}/large.mkv`, length: 1 }],
+			trackers: ["https://tracker.invalid/announce"],
+		}));
+		await upsertSearcheeClientDB(values);
+		const before = await db("ensemble_membership as member")
+			.join("source_origin as origin", "origin.id", "member.origin_id")
+			.whereIn(
+				"origin.source_key",
+				values.map((s) => s.infoHash),
+			)
+			.whereRaw("json_extract(origin.metadata,'$.clientHost')=?", [
+				"bulk-existing",
+			])
+			.select<
+				{
+					origin_id: string;
+					path_id: number;
+					ensemble: string;
+					element: string;
+					selection_order: number;
+				}[]
+			>("member.*")
+			.orderBy("member.selection_order");
+		queries.splice(0);
+		expect(await upsertSearcheeClientDB(values)).toBe(true);
+		const publicationQueries = queries.length;
+		expect(publicationQueries).toBeLessThanOrEqual(30);
+		const after = await db("ensemble_membership")
+			.whereIn(
+				"origin_id",
+				before.map((row) => row.origin_id),
+			)
+			.select("*")
+			.orderBy("selection_order");
+		expect(after).toEqual(before);
+		const origin = await db("source_origin")
+			.where("id", before[0].origin_id)
+			.first<{ metadata: string }>("metadata");
+		expect(JSON.parse(origin.metadata) as unknown).toEqual({
+			clientHost: "bulk-existing",
+			infoHash: "0",
+			name: values[0].name,
+			title: values[0].title,
+			savePath: "/fixture",
+		});
+		const cached = await db("client_searchee")
+			.where({ client_host: "bulk-existing", info_hash: "0" })
+			.first<{ files: string; trackers: string }>();
+		expect(JSON.parse(cached.files) as unknown).toEqual(values[0].files);
+		expect(JSON.parse(cached.trackers) as unknown).toEqual(
+			values[0].trackers,
+		);
+	});
+
 	it("reconciles exact named migrated legacy absence in the first validated empty snapshot", async () => {
 		const { bindClientSourceLocator, sourceMembershipQuery } =
 			await import("../src/sourceStore.js");
