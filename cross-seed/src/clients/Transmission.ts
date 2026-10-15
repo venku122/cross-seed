@@ -1,3 +1,13 @@
+import {
+	bindClientSourceLocator,
+	normalizeSourceLocator,
+} from "../sourceStore.js";
+import {
+	beginClientCacheOperation,
+	ClientCacheConcurrencyError,
+	releaseClientCacheOperation,
+} from "../clientCachePublication.js";
+import { cachedClientTorrents } from "./clientCache.js";
 import { readdir } from "fs/promises";
 import ms from "ms";
 import { basename } from "path";
@@ -9,14 +19,12 @@ import {
 	TORRENT_TAG,
 	USER_AGENT,
 } from "../constants.js";
-import { db } from "../db.js";
 import { CrossSeedError } from "../errors.js";
 import { Label, logger } from "../logger.js";
 import { Metafile } from "../parseTorrent.js";
 import { Result, resultOf, resultOfErr } from "../Result.js";
 import { getRuntimeConfig } from "../runtimeConfig.js";
 import {
-	ClientSearcheeRow,
 	createSearcheeFromDB,
 	parseTitle,
 	Searchee,
@@ -98,12 +106,16 @@ export default class Transmission implements TorrentClient {
 	readonly readonly: boolean;
 	readonly label: string;
 
+	private readonly sourceLocator: string;
+
 	constructor(
 		url: string,
 		clientHost: string,
 		priority: number,
 		readonly: boolean,
 	) {
+		this.sourceLocator = normalizeSourceLocator("client", url);
+		bindClientSourceLocator(clientHost, url);
 		this.url = url;
 		this.clientHost = clientHost;
 		this.clientPriority = priority;
@@ -347,106 +359,131 @@ export default class Transmission implements TorrentClient {
 		newSearcheesOnly?: boolean;
 		refresh?: string[];
 	}): Promise<ClientSearcheeResult> {
-		const searchees: SearcheeClient[] = [];
-		const newSearchees: SearcheeClient[] = [];
-		const infoHashes = new Set<string>();
-		let torrents: TorrentGetResponseArgs["torrents"];
+		const lease = beginClientCacheOperation(this.clientHost);
 		try {
-			torrents = (
-				await this.request<TorrentGetResponseArgs>("torrent-get", {
-					fields: [
-						"hashString",
-						"name",
-						"files",
-						"totalSize",
-						"downloadDir",
-						"labels",
-						"trackers",
-					],
-				})
-			).torrents;
-		} catch (e) {
-			logger.error({
-				label: this.label,
-				message: `Failed to get torrents from client: ${errorMessage(e)}`,
-			});
-			logger.debug(e);
-			return { searchees, newSearchees };
-		}
-		if (!torrents.length) {
-			logger.error({
-				label: this.label,
-				message: "No torrents found in client",
-			});
-			return { searchees, newSearchees };
-		}
-		for (const torrent of torrents) {
-			const infoHash = torrent.hashString.toLowerCase();
-			infoHashes.add(infoHash);
-			const dbTorrent = await db<ClientSearcheeRow>("client_searchee")
-				.where("info_hash", infoHash)
-				.where("client_host", this.clientHost)
-				.first();
-			const { name } = torrent;
-			const savePath = torrent.downloadDir;
-			const tags = torrent.labels;
-			const modified = clientSearcheeModified(
-				this.label,
-				dbTorrent,
-				name,
-				savePath,
-				{
-					tags,
-				},
-			);
-			const refresh =
-				options?.refresh === undefined
-					? false
-					: options.refresh.length === 0
-						? true
-						: options.refresh.includes(infoHash);
-			if (!modified && !refresh) {
-				if (!options?.newSearcheesOnly) {
-					searchees.push(createSearcheeFromDB(dbTorrent!));
-				}
-				continue;
-			}
-			const files = torrent.files.map((file) => ({
-				name: basename(file.name),
-				path: file.name,
-				length: file.length,
-			}));
-			if (!files.length) {
-				logger.verbose({
+			if (lease.sourceLocator !== this.sourceLocator)
+				throw new Error("Client configuration changed during refresh");
+			let metadataComplete = true;
+			const searchees: SearcheeClient[] = [];
+			const newSearchees: SearcheeClient[] = [];
+			const infoHashes = new Set<string>();
+			let torrents: TorrentGetResponseArgs["torrents"];
+			try {
+				torrents = (
+					await this.request<TorrentGetResponseArgs>("torrent-get", {
+						fields: [
+							"hashString",
+							"name",
+							"files",
+							"totalSize",
+							"downloadDir",
+							"labels",
+							"trackers",
+						],
+					})
+				).torrents;
+			} catch (e) {
+				logger.error({
 					label: this.label,
-					message: `No files found for ${torrent.name} [${sanitizeInfoHash(infoHash)}]: skipping`,
+					message: `Failed to get torrents from client: ${errorMessage(e)}`,
 				});
-				continue;
+				logger.debug(e);
+				throw e;
 			}
-			const trackers = organizeTrackers(
-				torrent.trackers.map((tracker) => ({
-					url: tracker.announce,
-					tier: tracker.tier,
-				})),
-			);
-			const title = parseTitle(name, files) ?? name;
-			const length = torrent.totalSize;
-			const searchee: SearcheeClient = {
+			for await (const {
+				torrent,
 				infoHash,
-				name,
-				title,
-				files,
-				length,
-				clientHost: this.clientHost,
-				savePath,
-				tags,
-				trackers,
-			};
-			newSearchees.push(searchee);
-			searchees.push(searchee);
+				useCache,
+				dbTorrent,
+			} of cachedClientTorrents(
+				torrents,
+				this.clientHost,
+				(torrent) => torrent.hashString.toLowerCase(),
+				(torrent, dbTorrent, infoHash) => {
+					const { name } = torrent;
+					const savePath = torrent.downloadDir;
+					const tags = torrent.labels;
+					const modified = clientSearcheeModified(
+						this.label,
+						dbTorrent,
+						name,
+						savePath,
+						{
+							tags,
+						},
+					);
+					const refresh =
+						options?.refresh === undefined
+							? false
+							: options.refresh.length === 0
+								? true
+								: options.refresh.includes(infoHash);
+
+					return !modified && !refresh;
+				},
+				!options?.newSearcheesOnly && options?.refresh?.length !== 0,
+				lease.sourceLocator,
+			)) {
+				infoHashes.add(infoHash);
+				if (useCache) {
+					if (!options?.newSearcheesOnly) {
+						searchees.push(createSearcheeFromDB(dbTorrent!));
+					}
+					continue;
+				}
+
+				const { name } = torrent;
+				const savePath = torrent.downloadDir;
+				const tags = torrent.labels;
+				const files = torrent.files.map((file) => ({
+					name: basename(file.name),
+					path: file.name,
+					length: file.length,
+				}));
+				if (!files.length) {
+					logger.verbose({
+						label: this.label,
+						message: `No files found for ${torrent.name} [${sanitizeInfoHash(infoHash)}]: skipping`,
+					});
+					metadataComplete = false;
+					continue;
+				}
+				const trackers = organizeTrackers(
+					torrent.trackers.map((tracker) => ({
+						url: tracker.announce,
+						tier: tracker.tier,
+					})),
+				);
+				const title = parseTitle(name, files) ?? name;
+				const length = torrent.totalSize;
+				const searchee: SearcheeClient = {
+					infoHash,
+					name,
+					title,
+					files,
+					length,
+					clientHost: this.clientHost,
+					savePath,
+					tags,
+					trackers,
+				};
+				newSearchees.push(searchee);
+				searchees.push(searchee);
+			}
+			const accepted = await updateSearcheeClientDB(
+				this.clientHost,
+				newSearchees,
+				infoHashes,
+				lease,
+				metadataComplete,
+			);
+			if (!accepted) throw new ClientCacheConcurrencyError();
+			if (!metadataComplete)
+				throw new Error("Client catalog metadata hydration incomplete");
+			return { searchees, newSearchees };
+		} finally {
+			releaseClientCacheOperation(lease);
 		}
-		await updateSearcheeClientDB(this.clientHost, newSearchees, infoHashes);
-		return { searchees, newSearchees };
 	}
 
 	async recheckTorrent(infoHash: string): Promise<void> {

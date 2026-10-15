@@ -1,3 +1,13 @@
+import {
+	bindClientSourceLocator,
+	normalizeSourceLocator,
+} from "../sourceStore.js";
+import {
+	beginClientCacheOperation,
+	ClientCacheConcurrencyError,
+	releaseClientCacheOperation,
+} from "../clientCachePublication.js";
+import { cachedClientTorrents } from "./clientCache.js";
 import { type Stats } from "fs";
 import { readdir, stat } from "fs/promises";
 import { basename, dirname, join, resolve, sep } from "path";
@@ -10,14 +20,12 @@ import {
 	TORRENT_TAG,
 	USER_AGENT,
 } from "../constants.js";
-import { db } from "../db.js";
 import { CrossSeedError } from "../errors.js";
 import { Label, logger } from "../logger.js";
 import { Metafile } from "../parseTorrent.js";
 import { Result, resultOf, resultOfErr } from "../Result.js";
 import { getRuntimeConfig } from "../runtimeConfig.js";
 import {
-	ClientSearcheeRow,
 	createSearcheeFromDB,
 	File,
 	parseTitle,
@@ -116,12 +124,16 @@ export default class RTorrent implements TorrentClient {
 	readonly label: string;
 	readonly batchSize = 500;
 
+	private readonly sourceLocator: string;
+
 	constructor(
 		url: string,
 		clientHost: string,
 		priority: number,
 		readonly: boolean,
 	) {
+		this.sourceLocator = normalizeSourceLocator("client", url);
+		bindClientSourceLocator(clientHost, url);
 		this.clientHost = clientHost;
 		this.clientPriority = priority;
 		this.readonly = readonly;
@@ -612,167 +624,238 @@ export default class RTorrent implements TorrentClient {
 		newSearcheesOnly?: boolean;
 		refresh?: string[];
 	}): Promise<ClientSearcheeResult> {
-		const searchees: SearcheeClient[] = [];
-		const newSearchees: SearcheeClient[] = [];
-		const hashes = await this.methodCallP<string[]>("download_list", []);
-		type ReturnType = any[][] | Fault[]; // eslint-disable-line @typescript-eslint/no-explicit-any
-		function isFault(response: ReturnType): response is Fault[] {
-			return "faultString" in response[0];
-		}
+		const lease = beginClientCacheOperation(this.clientHost);
+		try {
+			if (lease.sourceLocator !== this.sourceLocator)
+				throw new Error("Client configuration changed during refresh");
+			let metadataComplete = true;
+			const searchees: SearcheeClient[] = [];
+			const newSearchees: SearcheeClient[] = [];
+			const hashes = await this.methodCallP<string[]>(
+				"download_list",
+				[],
+			);
+			if (!hashes.length) {
+				if (
+					!(await updateSearcheeClientDB(
+						this.clientHost,
+						[],
+						new Set(),
+						lease,
+					))
+				)
+					throw new ClientCacheConcurrencyError();
+				return { searchees, newSearchees };
+			}
 
-		let numMethods = 0;
-		const results = await fromBatches(
-			hashes,
-			async (batch) => {
-				const args = [
-					batch.flatMap((hash) => {
-						const arg = [
-							{
-								methodName: "d.name",
-								params: [hash],
-							},
-							{
-								methodName: "d.size_bytes",
-								params: [hash],
-							},
-							{
-								methodName: "d.directory",
-								params: [hash],
-							},
-							{
-								methodName: "d.is_multi_file",
-								params: [hash],
-							},
-							{
-								methodName: "d.custom1",
-								params: [hash],
-							},
-							{
-								methodName: "f.multicall",
-								params: [hash, "", "f.path=", "f.size_bytes="],
-							},
-							{
-								methodName: "t.multicall",
-								params: [hash, "", "t.url=", "t.group="],
-							},
-						];
-						numMethods = arg.length;
-						return arg;
-					}),
-				];
-				try {
-					const res = await this.methodCallP<ReturnType>(
-						"system.multicall",
-						args,
-					);
-					if (isFault(res)) {
+			type ReturnType = any[][] | Fault[]; // eslint-disable-line @typescript-eslint/no-explicit-any
+			function isFault(response: ReturnType): response is Fault[] {
+				return "faultString" in response[0];
+			}
+
+			let numMethods = 0;
+			const results = await fromBatches(
+				hashes,
+				async (batch) => {
+					const args = [
+						batch.flatMap((hash) => {
+							const arg = [
+								{
+									methodName: "d.name",
+									params: [hash],
+								},
+								{
+									methodName: "d.size_bytes",
+									params: [hash],
+								},
+								{
+									methodName: "d.directory",
+									params: [hash],
+								},
+								{
+									methodName: "d.is_multi_file",
+									params: [hash],
+								},
+								{
+									methodName: "d.custom1",
+									params: [hash],
+								},
+								{
+									methodName: "f.multicall",
+									params: [
+										hash,
+										"",
+										"f.path=",
+										"f.size_bytes=",
+									],
+								},
+								{
+									methodName: "t.multicall",
+									params: [hash, "", "t.url=", "t.group="],
+								},
+							];
+							numMethods = arg.length;
+							return arg;
+						}),
+					];
+					try {
+						const res = await this.methodCallP<ReturnType>(
+							"system.multicall",
+							args,
+						);
+						if (isFault(res)) {
+							logger.error({
+								label: this.label,
+								message: "Fault while getting client torrents",
+							});
+							logger.debug(inspect(res));
+							return [];
+						}
+						return res;
+					} catch (e) {
 						logger.error({
 							label: this.label,
-							message: "Fault while getting client torrents",
+							message: `Failed to get client torrents: ${errorMessage(e)}`,
 						});
-						logger.debug(inspect(res));
+						logger.debug(e);
 						return [];
 					}
-					return res;
-				} catch (e) {
-					logger.error({
-						label: this.label,
-						message: `Failed to get client torrents: ${errorMessage(e)}`,
-					});
-					logger.debug(e);
-					return [];
-				}
-			},
-			{ batchSize: this.batchSize },
-		);
-		if (!results.length || results.length !== hashes.length * numMethods) {
-			logger.error({
-				label: this.label,
-				message: `Unexpected number of results: ${results.length} for ${hashes.length} hashes`,
-			});
-			return { searchees, newSearchees };
-		}
-		const infoHashes = new Set<string>();
-		for (let i = 0; i < hashes.length; i++) {
-			const infoHash = hashes[i].toLowerCase();
-			infoHashes.add(infoHash);
-			const dbTorrent = await db<ClientSearcheeRow>("client_searchee")
-				.where("info_hash", infoHash)
-				.where("client_host", this.clientHost)
-				.first();
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			const r: any[][] = results;
-			const name: string = r[i * numMethods][0] as string;
-			const directory: string = r[i * numMethods + 2][0] as string;
-			const isMultiFile = Boolean(
-				Number(r[i * numMethods + 3][0] as string),
-			);
-			const labels: string = r[i * numMethods + 4][0] as string;
-			const savePath = isMultiFile ? dirname(directory) : directory;
-			const tags = labels.length
-				? decodeURIComponent(labels)
-						.split(",")
-						.map((tag) => tag.trim())
-				: [];
-			const modified = clientSearcheeModified(
-				this.label,
-				dbTorrent,
-				name,
-				savePath,
-				{
-					tags,
 				},
+				{ batchSize: this.batchSize },
 			);
-			const refresh =
-				options?.refresh === undefined
-					? false
-					: options.refresh.length === 0
-						? true
-						: options.refresh.includes(infoHash);
-			if (!modified && !refresh) {
-				if (!options?.newSearcheesOnly) {
-					searchees.push(createSearcheeFromDB(dbTorrent!));
-				}
-				continue;
-			}
-			const length = Number(r[i * numMethods + 1][0] as string);
-			const files: File[] = (
-				r[i * numMethods + 5][0] as [string, string][]
-			).map((arr) => ({
-				name: basename(arr[0]),
-				path: isMultiFile ? join(basename(directory), arr[0]) : arr[0],
-				length: Number(arr[1]),
-			}));
-			if (!files.length) {
-				logger.verbose({
+			if (
+				!results.length ||
+				results.length !== hashes.length * numMethods
+			) {
+				logger.error({
 					label: this.label,
-					message: `No files found for ${name} [${sanitizeInfoHash(infoHash)}]: skipping`,
+					message: `Unexpected number of results: ${results.length} for ${hashes.length} hashes`,
 				});
-				continue;
+				throw new Error("Client catalog metadata hydration incomplete");
 			}
-			const trackers = organizeTrackers(
-				(r[i * numMethods + 6][0] as [string, string][]).map((arr) => ({
-					url: arr[0],
-					tier: Number(arr[1]),
-				})),
-			);
-			const title = parseTitle(name, files) ?? name;
-			const searchee: SearcheeClient = {
+			const infoHashes = new Set<string>();
+			for await (const {
+				index: i,
 				infoHash,
-				name,
-				title,
-				files,
-				length,
-				clientHost: this.clientHost,
-				savePath,
-				tags,
-				trackers,
-			};
-			newSearchees.push(searchee);
-			searchees.push(searchee);
+				useCache,
+				dbTorrent,
+			} of cachedClientTorrents(
+				hashes,
+				this.clientHost,
+				(hash) => hash.toLowerCase(),
+				(_hash, dbTorrent, infoHash, i) => {
+					const name = results[i * numMethods][0] as string;
+					const directory = results[i * numMethods + 2][0] as string;
+					const isMultiFile = Boolean(
+						Number(results[i * numMethods + 3][0] as string),
+					);
+					const labels = results[i * numMethods + 4][0] as string;
+					const savePath = isMultiFile
+						? dirname(directory)
+						: directory;
+					const tags = labels.length
+						? decodeURIComponent(labels)
+								.split(",")
+								.map((tag) => tag.trim())
+						: [];
+					const modified = clientSearcheeModified(
+						this.label,
+						dbTorrent,
+						name,
+						savePath,
+						{
+							tags,
+						},
+					);
+					const refresh =
+						options?.refresh === undefined
+							? false
+							: options.refresh.length === 0
+								? true
+								: options.refresh.includes(infoHash);
+
+					return !modified && !refresh;
+				},
+				!options?.newSearcheesOnly && options?.refresh?.length !== 0,
+				lease.sourceLocator,
+			)) {
+				infoHashes.add(infoHash);
+				if (useCache) {
+					if (!options?.newSearcheesOnly) {
+						searchees.push(createSearcheeFromDB(dbTorrent!));
+					}
+					continue;
+				}
+
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				const r: any[][] = results;
+				const name: string = r[i * numMethods][0] as string;
+				const directory: string = r[i * numMethods + 2][0] as string;
+				const isMultiFile = Boolean(
+					Number(r[i * numMethods + 3][0] as string),
+				);
+				const labels: string = r[i * numMethods + 4][0] as string;
+				const savePath = isMultiFile ? dirname(directory) : directory;
+				const tags = labels.length
+					? decodeURIComponent(labels)
+							.split(",")
+							.map((tag) => tag.trim())
+					: [];
+				const length = Number(r[i * numMethods + 1][0] as string);
+				const files: File[] = (
+					r[i * numMethods + 5][0] as [string, string][]
+				).map((arr) => ({
+					name: basename(arr[0]),
+					path: isMultiFile
+						? join(basename(directory), arr[0])
+						: arr[0],
+					length: Number(arr[1]),
+				}));
+				if (!files.length) {
+					logger.verbose({
+						label: this.label,
+						message: `No files found for ${name} [${sanitizeInfoHash(infoHash)}]: skipping`,
+					});
+					metadataComplete = false;
+					continue;
+				}
+				const trackers = organizeTrackers(
+					(r[i * numMethods + 6][0] as [string, string][]).map(
+						(arr) => ({
+							url: arr[0],
+							tier: Number(arr[1]),
+						}),
+					),
+				);
+				const title = parseTitle(name, files) ?? name;
+				const searchee: SearcheeClient = {
+					infoHash,
+					name,
+					title,
+					files,
+					length,
+					clientHost: this.clientHost,
+					savePath,
+					tags,
+					trackers,
+				};
+				newSearchees.push(searchee);
+				searchees.push(searchee);
+			}
+			const accepted = await updateSearcheeClientDB(
+				this.clientHost,
+				newSearchees,
+				infoHashes,
+				lease,
+				metadataComplete,
+			);
+			if (!accepted) throw new ClientCacheConcurrencyError();
+			if (!metadataComplete)
+				throw new Error("Client catalog metadata hydration incomplete");
+			return { searchees, newSearchees };
+		} finally {
+			releaseClientCacheOperation(lease);
 		}
-		await updateSearcheeClientDB(this.clientHost, newSearchees, infoHashes);
-		return { searchees, newSearchees };
 	}
 
 	async recheckTorrent(infoHash: string): Promise<void> {

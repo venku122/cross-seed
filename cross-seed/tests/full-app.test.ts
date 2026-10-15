@@ -318,15 +318,16 @@ describe.sequential("full app flows", () => {
 		const fakeClient = new FakeTorrentClient(fakeTorrent.server);
 		env.setClientsForTesting([fakeClient]);
 
-		const { injectSavedTorrents } = await import("../src/inject.js");
-		await injectSavedTorrents();
-
-		expect(fakeTorrent.state.torrents.has(meta.infoHash)).toBe(true);
 		const savedFiles = await readdir(outputDir);
 		const parsed = savedFiles
 			.map((file) => env.parseMetadataFromFilename(file))
 			.filter((entry) => entry.infoHash === meta.infoHash);
 		expect(parsed.length).toBeGreaterThanOrEqual(1);
+
+		const { injectSavedTorrents } = await import("../src/inject.js");
+		await injectSavedTorrents();
+
+		expect(fakeTorrent.state.torrents.has(meta.infoHash)).toBe(true);
 
 		await env.db.destroy();
 	});
@@ -389,6 +390,67 @@ describe.sequential("full app flows", () => {
 		expect(linkedStat.ino).toBe(sourceStat.ino);
 		expect(linkedStat.dev).toBe(sourceStat.dev);
 
+		await env.db.destroy();
+	});
+	it("preserves duplicate-size source selection and hardlinks for a large release", async () => {
+		const env = await createRuntimeEnv();
+		const rootName = "Show.Name.S01.1080p.WEB-DL-GROUP";
+		const dataDir = join(TEST_ROOT, "large-hardlink", "data");
+		const releaseDir = join(dataDir, rootName);
+		const outputDir = join(TEST_ROOT, "large-hardlink", "output");
+		const linkDir = join(TEST_ROOT, "large-hardlink", "links");
+		await mkdir(releaseDir, { recursive: true });
+		await mkdir(outputDir, { recursive: true });
+		await mkdir(linkDir, { recursive: true });
+		const files = Array.from({ length: 160 }, (_, i) => ({
+			path: `episode-${i}.mkv`,
+			length: 256 + Math.floor(i / 2),
+		}));
+		for (const [index, file] of files.entries()) {
+			await writeFile(
+				join(releaseDir, file.path),
+				Buffer.alloc(file.length, index),
+			);
+		}
+		torznab.state.setTorrents([
+			{
+				id: "large-synthetic",
+				title: rootName,
+				torrentName: rootName,
+				files: files.toReversed(),
+				tracker: "mock-torznab",
+			},
+		]);
+		const normalizedTorrent = torznab.state.resolveTorrents()[0];
+		const meta = env.Metafile.decode(normalizedTorrent.torrentPayload);
+		const torrentPath = env.getTorrentSavePath(
+			meta,
+			env.getMediaType(meta),
+			normalizedTorrent.tracker,
+			outputDir,
+			{ cached: false },
+		);
+		await writeFile(torrentPath, meta.encode());
+		applyConfig(env, {
+			action: env.Action.INJECT,
+			dataDirs: [dataDir],
+			outputDir,
+			useClientTorrents: false,
+			linkDirs: [linkDir],
+			linkType: env.LinkType.HARDLINK,
+			flatLinking: true,
+			includeSingleEpisodes: true,
+		});
+		env.setClientsForTesting([new FakeTorrentClient(fakeTorrent.server)]);
+		const { injectSavedTorrents } = await import("../src/inject.js");
+		await injectSavedTorrents();
+		expect(fakeTorrent.state.torrents.has(meta.infoHash)).toBe(true);
+		for (const file of meta.files) {
+			const source = await stat(join(releaseDir, file.name));
+			const linked = await stat(join(linkDir, file.path));
+			expect(linked.ino).toBe(source.ino);
+			expect(linked.dev).toBe(source.dev);
+		}
 		await env.db.destroy();
 	});
 });

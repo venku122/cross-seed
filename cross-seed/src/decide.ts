@@ -1,3 +1,5 @@
+import { performance } from "node:perf_hooks";
+import { recordPerformance } from "./performanceTelemetry.js";
 import bencode from "bencode";
 import { readFile, stat, unlink, utimes, writeFile } from "fs/promises";
 import ms from "ms";
@@ -147,7 +149,203 @@ function logDecision(
 	});
 }
 
+// These indexes avoid repeated O(candidateFiles * searcheeFiles) searches on
+// large releases. Preserve the old paths for small releases and their low overhead.
+function shouldIndexFileComparison(
+	candidate: Metafile,
+	searchee: Searchee,
+): boolean {
+	return candidate.files.length >= 128 && searchee.files.length >= 128;
+}
+
+// Unique sizes store one offset; small tied groups store at most eight offsets.
+// Larger groups use maps so matching remains linear in the file count.
+// The index is immutable during matching; each consuming pass owns its counters.
+type IndexedFileGroup = {
+	first: number;
+	total: number;
+	names: Map<string, { index: number; count: number }>;
+	paths?: Set<string>;
+};
+type FileIndex = Map<number, number | number[] | IndexedFileGroup>;
+type GetFileIndex = (includePaths?: boolean) => FileIndex;
+function indexFileGroups(files: File[], includePaths = false): FileIndex {
+	const groups: FileIndex = new Map();
+	for (let i = 0; i < files.length; i++) {
+		const file = files[i];
+		const length = file.length;
+		// Array matching uses ===: NaN never matches, signed zero does.
+		if (Number.isNaN(length)) continue;
+		const existing = groups.get(length);
+		if (existing === undefined) {
+			groups.set(length, i);
+			continue;
+		}
+		if (typeof existing === "number") {
+			groups.set(length, [existing, i]);
+			continue;
+		}
+		let group: IndexedFileGroup;
+		if (Array.isArray(existing)) {
+			existing.push(i);
+			if (existing.length <= 8) continue;
+			group = {
+				first: existing[0],
+				total: existing.length,
+				names: new Map(),
+				paths: includePaths ? new Set() : undefined,
+			};
+			for (const index of existing) {
+				const entry = files[index];
+				const name = group.names.get(entry.name);
+				if (name) name.count++;
+				else group.names.set(entry.name, { index, count: 1 });
+				group.paths?.add(entry.path);
+			}
+			groups.set(length, group);
+			continue;
+		} else group = existing;
+		group.total++;
+		const name = group.names.get(file.name);
+		if (name) name.count++;
+		else group.names.set(file.name, { index: i, count: 1 });
+		group.paths?.add(file.path);
+	}
+	return groups;
+}
+
+function consumeIndexedFile(
+	groups: FileIndex,
+	consumed: Uint32Array,
+	files: File[],
+	file: File,
+): boolean {
+	const group = groups.get(file.length);
+	if (group === undefined) return false;
+	if (typeof group === "number") {
+		if (consumed[group]) return false;
+		consumed[group] = 1;
+		return true;
+	}
+	const fileCount = files.length;
+	if (Array.isArray(group)) {
+		const remaining = group.length - consumed[group[0]];
+		if (!remaining) return false;
+		if (remaining > 1) {
+			let matched = false;
+			for (const index of group) {
+				if (
+					!consumed[fileCount + index] &&
+					files[index].name === file.name
+				) {
+					consumed[fileCount + index] = 1;
+					matched = true;
+					break;
+				}
+			}
+			if (!matched) return false;
+		}
+		consumed[group[0]]++;
+		return true;
+	}
+	const remaining = group.total - consumed[group.first];
+	if (!remaining) return false;
+	if (remaining > 1) {
+		const name = group.names.get(file.name);
+		if (!name || consumed[fileCount + name.index] === name.count)
+			return false;
+		consumed[fileCount + name.index]++;
+	}
+	consumed[group.first]++;
+	return true;
+}
+
+function hasFileSize(length: number, files: File[]): boolean {
+	for (let i = 0; i < files.length; i++) {
+		if (files[i].length === length) return true;
+	}
+	return false;
+}
+
+function canMatchFirstFileBySize(candidate: File, files: File[]): boolean {
+	const length = candidate.length;
+	const name = candidate.name;
+	let count = 0;
+	for (let i = 0; i < files.length; i++) {
+		const file = files[i];
+		if (file.length !== length) continue;
+		if (file.name === name) return true;
+		count++;
+	}
+	return count === 1;
+}
+
+function canMatchFirstFileExactly(
+	candidate: File,
+	files: File[],
+	useNames: boolean,
+): boolean {
+	const length = candidate.length;
+	const field = useNames ? "name" : "path";
+	const nameOrPath = candidate[field];
+	for (let i = 0; i < files.length; i++) {
+		const file = files[i];
+		if (file.length === length && file[field] === nameOrPath) return true;
+	}
+	return false;
+}
+
+function createAssessmentFileIndex(searchee: Searchee): GetFileIndex {
+	let fileIndex: FileIndex | undefined;
+	return (includePaths = false) =>
+		(fileIndex ??= indexFileGroups(searchee.files, includePaths));
+}
+
 export function compareFileTrees(
+	candidate: Metafile,
+	searchee: Searchee,
+): boolean {
+	return shouldIndexFileComparison(candidate, searchee)
+		? compareFileTreesIndexed(candidate, searchee)
+		: compareFileTreesArray(candidate, searchee);
+}
+
+function compareFileTreesIndexed(
+	candidate: Metafile,
+	searchee: Searchee,
+	getIndex?: GetFileIndex,
+): boolean {
+	const field = !searchee.infoHash && !searchee.path ? "name" : "path";
+	// Reject the first-file mismatch before allocating the full index.
+	if (
+		!canMatchFirstFileExactly(
+			candidate.files[0],
+			searchee.files,
+			field === "name",
+		)
+	)
+		return false;
+	const indexedFiles =
+		getIndex?.(field === "path") ??
+		indexFileGroups(searchee.files, field === "path");
+	return candidate.files.every((file) => {
+		const group = indexedFiles.get(file.length);
+		if (group === undefined) return false;
+		if (typeof group === "number")
+			return searchee.files[group][field] === file[field];
+		if (Array.isArray(group)) {
+			for (const index of group) {
+				if (searchee.files[index][field] === file[field]) return true;
+			}
+			return false;
+		}
+		return field === "name"
+			? group.names.has(file.name)
+			: group.paths!.has(file.path);
+	});
+}
+
+function compareFileTreesArray(
 	candidate: Metafile,
 	searchee: Searchee,
 ): boolean {
@@ -176,6 +374,29 @@ export function compareFileTreesIgnoringNames(
 	candidate: Metafile,
 	searchee: Searchee,
 ): boolean {
+	return shouldIndexFileComparison(candidate, searchee)
+		? compareFileTreesIgnoringNamesIndexed(candidate, searchee)
+		: compareFileTreesIgnoringNamesArray(candidate, searchee);
+}
+
+function compareFileTreesIgnoringNamesIndexed(
+	candidate: Metafile,
+	searchee: Searchee,
+	getIndex?: GetFileIndex,
+): boolean {
+	if (!canMatchFirstFileBySize(candidate.files[0], searchee.files))
+		return false;
+	const groups = getIndex?.() ?? indexFileGroups(searchee.files);
+	const consumed = new Uint32Array(2 * searchee.files.length);
+	return candidate.files.every((file) =>
+		consumeIndexedFile(groups, consumed, searchee.files, file),
+	);
+}
+
+function compareFileTreesIgnoringNamesArray(
+	candidate: Metafile,
+	searchee: Searchee,
+): boolean {
 	const availableFiles = searchee.files.slice();
 	for (const candidateFile of candidate.files) {
 		let matchedSearcheeFiles = availableFiles.filter(
@@ -199,6 +420,37 @@ export function getPartialSizeRatio(
 	candidate: Metafile,
 	searchee: Searchee,
 ): number {
+	return shouldIndexFileComparison(candidate, searchee)
+		? getPartialSizeRatioIndexed(candidate, searchee)
+		: getPartialSizeRatioArray(candidate, searchee);
+}
+
+function getPartialSizeRatioIndexed(
+	candidate: Metafile,
+	searchee: Searchee,
+	getIndex?: GetFileIndex,
+): number {
+	// Assessment can reuse the group keys; standalone ratio needs sizes only.
+	const sizes = getIndex?.() ?? new Set<number>();
+	if (!getIndex) {
+		for (const file of searchee.files) {
+			const length = file.length;
+			if (!Number.isNaN(length)) (sizes as Set<number>).add(length);
+		}
+	}
+	let matchedSizes = 0;
+	for (const file of candidate.files) {
+		if (!Number.isNaN(file.length) && sizes.has(file.length)) {
+			matchedSizes += file.length;
+		}
+	}
+	return matchedSizes / candidate.length;
+}
+
+function getPartialSizeRatioArray(
+	candidate: Metafile,
+	searchee: Searchee,
+): number {
 	let matchedSizes = 0;
 	for (const candidateFile of candidate.files) {
 		const searcheeHasFileSize = searchee.files.some(
@@ -212,6 +464,32 @@ export function getPartialSizeRatio(
 }
 
 export function compareFileTreesPartial(
+	candidate: Metafile,
+	searchee: Searchee,
+): boolean {
+	return shouldIndexFileComparison(candidate, searchee)
+		? compareFileTreesPartialIndexed(candidate, searchee)
+		: compareFileTreesPartialArray(candidate, searchee);
+}
+
+function compareFileTreesPartialIndexed(
+	candidate: Metafile,
+	searchee: Searchee,
+	getIndex?: GetFileIndex,
+): boolean {
+	const groups = getIndex?.() ?? indexFileGroups(searchee.files);
+	const consumed = new Uint32Array(2 * searchee.files.length);
+	let matchedSizes = 0;
+	for (const file of candidate.files) {
+		if (consumeIndexedFile(groups, consumed, searchee.files, file))
+			matchedSizes += file.length;
+	}
+	const totalPieces = Math.ceil(candidate.length / candidate.pieceLength);
+	const availablePieces = Math.floor(matchedSizes / candidate.pieceLength);
+	return availablePieces / totalPieces >= getMinSizeRatio(searchee);
+}
+
+function compareFileTreesPartialArray(
 	candidate: Metafile,
 	searchee: Searchee,
 ): boolean {
@@ -324,6 +602,40 @@ export async function assessCandidate(
 	blockList: string[],
 	options?: { configOverride: Partial<RuntimeConfig> },
 ): Promise<ResultAssessment> {
+	if (process.env.CROSS_SEED_PERFORMANCE_TELEMETRY !== "1") {
+		return assessCandidateImpl(
+			metaOrCandidate,
+			searchee,
+			infoHashesToExclude,
+			blockList,
+			options,
+		);
+	}
+	const started = performance.now();
+	try {
+		return await assessCandidateImpl(
+			metaOrCandidate,
+			searchee,
+			infoHashesToExclude,
+			blockList,
+			options,
+		);
+	} finally {
+		recordPerformance({
+			operation: "candidate",
+			durationMs: performance.now() - started,
+			fileCount: searchee.files.length,
+		});
+	}
+}
+
+async function assessCandidateImpl(
+	metaOrCandidate: Metafile | Candidate,
+	searchee: SearcheeWithLabel,
+	infoHashesToExclude: Set<string>,
+	blockList: string[],
+	options?: { configOverride: Partial<RuntimeConfig> },
+): Promise<ResultAssessment> {
 	const { includeSingleEpisodes, matchMode } = getRuntimeConfig(
 		options?.configOverride,
 	);
@@ -417,19 +729,39 @@ export async function assessCandidate(
 		return { decision: Decision.FILE_TREE_MISMATCH, metafile, metaCached };
 	}
 
-	const perfectMatch = compareFileTrees(metafile, searchee);
+	const indexFiles = shouldIndexFileComparison(metafile, searchee);
+	// An absent first size rules out both full matchers, regardless of names.
+	// Partial mode must still measure the remaining files before rejecting.
+	if (
+		indexFiles &&
+		matchMode !== MatchMode.PARTIAL &&
+		!hasFileSize(metafile.files[0].length, searchee.files)
+	) {
+		return { decision: Decision.SIZE_MISMATCH, metafile, metaCached };
+	}
+	// Small assessments use the baseline routines directly, with no index context.
+	const getFileIndex = indexFiles
+		? createAssessmentFileIndex(searchee)
+		: undefined;
+	const perfectMatch = getFileIndex
+		? compareFileTreesIndexed(metafile, searchee, getFileIndex)
+		: compareFileTreesArray(metafile, searchee);
 	if (perfectMatch) {
 		return { decision: Decision.MATCH, metafile, metaCached };
 	}
 
-	const sizeMatch = compareFileTreesIgnoringNames(metafile, searchee);
+	const sizeMatch = getFileIndex
+		? compareFileTreesIgnoringNamesIndexed(metafile, searchee, getFileIndex)
+		: compareFileTreesIgnoringNamesArray(metafile, searchee);
 	if (sizeMatch && matchMode !== MatchMode.STRICT) {
 		return { decision: Decision.MATCH_SIZE_ONLY, metafile, metaCached };
 	}
 
 	if (matchMode === MatchMode.PARTIAL) {
 		const partialSizeMatch =
-			getPartialSizeRatio(metafile, searchee) >=
+			(getFileIndex
+				? getPartialSizeRatioIndexed(metafile, searchee, getFileIndex)
+				: getPartialSizeRatioArray(metafile, searchee)) >=
 			getMinSizeRatio(searchee);
 		if (!partialSizeMatch) {
 			return {
@@ -438,7 +770,9 @@ export async function assessCandidate(
 				metaCached,
 			};
 		}
-		const partialMatch = compareFileTreesPartial(metafile, searchee);
+		const partialMatch = getFileIndex
+			? compareFileTreesPartialIndexed(metafile, searchee, getFileIndex)
+			: compareFileTreesPartialArray(metafile, searchee);
 		if (partialMatch) {
 			return { decision: Decision.MATCH_PARTIAL, metafile, metaCached };
 		}

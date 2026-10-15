@@ -1,3 +1,7 @@
+import {
+	ClientCacheConcurrencyError,
+	restartClientCachePublication,
+} from "../clientCachePublication.js";
 import ms from "ms";
 import path from "path";
 import { isDeepStrictEqual } from "util";
@@ -32,15 +36,19 @@ import QBittorrent from "./QBittorrent.js";
 import RTorrent from "./RTorrent.js";
 import Transmission from "./Transmission.js";
 
+import { invalidateHealth } from "../healthGeneration.js";
+
 const activeClients: TorrentClient[] = [];
 
 export function setClientsForTesting(clients: TorrentClient[]): void {
 	activeClients.length = 0;
 	activeClients.push(...clients);
+	invalidateHealth();
 }
 
 export function resetClientsForTesting(): void {
 	activeClients.length = 0;
+	invalidateHealth();
 }
 
 type TorrentClientType =
@@ -77,6 +85,7 @@ export interface TorrentClient {
 		infoHash: string,
 	) => Promise<Result<boolean, "NOT_FOUND">>;
 	getAllTorrents: () => Promise<TorrentMetadataInClient[]>;
+	getHealthSavePaths?: () => Promise<string[]>;
 	/**
 	 * Get all searchees from the client and update the db
 	 * @param options.newSearcheesOnly only return searchees that are not in the db
@@ -91,6 +100,8 @@ export interface TorrentClient {
 		includeFiles?: boolean;
 		includeTrackers?: boolean;
 	}) => Promise<ClientSearcheeResult>;
+	/** Refresh a single source without reconciling an incomplete snapshot. */
+	refreshOne?: (infoHash: string) => Promise<SearcheeClient | undefined>;
 	getDownloadDir: (
 		meta: SearcheeWithInfoHash | Metafile,
 		options: { onlyCompleted: boolean },
@@ -120,7 +131,7 @@ export interface TorrentClient {
 		options: { onlyCompleted: boolean; destinationDir?: string },
 	) => Promise<InjectionResult>;
 	recheckTorrent: (infoHash: string) => Promise<void>;
-	validateConfig: () => Promise<void>;
+	validateConfig: (options?: { healthOnly?: boolean }) => Promise<void>;
 }
 
 const PARSE_CLIENT_REGEX =
@@ -160,13 +171,15 @@ export function clientsAreUnique(torrentClients: string[]): {
 
 export function instantiateDownloadClients() {
 	const { torrentClients } = getRuntimeConfig();
-	const { uniqueHosts } = clientsAreUnique(torrentClients);
 	for (const [priority, clientEntryRaw] of torrentClients.entries()) {
 		const { clientType, readonly, url } = parseClientEntry(clientEntryRaw)!;
 		const urlObj = new URL(url);
-		const clientHost = uniqueHosts
-			? urlObj.host
-			: `${urlObj.host}${urlObj.pathname}`;
+		// A configured proxy endpoint keeps its identity when another client is
+		// added. Root endpoints retain the existing host-only label.
+		const pathname = urlObj.pathname
+			.replace(/\/+/g, "/")
+			.replace(/\/$/, "");
+		const clientHost = `${urlObj.host}${pathname}`;
 		switch (clientType) {
 			case Label.QBITTORRENT:
 				activeClients.push(
@@ -193,8 +206,11 @@ export function instantiateDownloadClients() {
 }
 
 export function reloadDownloadClients() {
+	// Late responses from the previous endpoint configuration cannot publish.
+	restartClientCachePublication();
 	activeClients.length = 0;
 	instantiateDownloadClients();
+	invalidateHealth();
 }
 
 export function getClients(): TorrentClient[] {
@@ -211,7 +227,9 @@ export function byClientHostPriority(clientHost: string | undefined): number {
 
 export function clientSearcheeModified(
 	label: string,
-	dbTorrent: ClientSearcheeRow | undefined,
+	dbTorrent:
+		| Pick<ClientSearcheeRow, "name" | "save_path" | "category" | "tags">
+		| undefined,
 	name: string,
 	savePath: string,
 	options: { category?: string; tags?: string[] } = {},
@@ -229,6 +247,30 @@ export function clientSearcheeModified(
 		return true;
 	}
 	return false;
+}
+
+/** Preserve existing full-refresh behavior for adapters without scoped support. */
+export async function refreshClientSearchee(
+	client: TorrentClient,
+	infoHash: string,
+): Promise<SearcheeClient | undefined> {
+	if (client.refreshOne) return client.refreshOne(infoHash);
+	for (let attempt = 0; attempt < 3; attempt++) {
+		try {
+			const result = await client.getClientSearchees({
+				newSearcheesOnly: true,
+				refresh: [infoHash],
+			});
+			return result.newSearchees.find((s) => s.infoHash === infoHash);
+		} catch (error) {
+			if (
+				!(error instanceof ClientCacheConcurrencyError) ||
+				attempt === 2
+			)
+				throw error;
+		}
+	}
+	throw new ClientCacheConcurrencyError();
 }
 
 export function organizeTrackers(trackers: Tracker[]): string[] {
@@ -426,7 +468,7 @@ export async function collectClientProblems(): Promise<Problem[]> {
 	}
 
 	const validationResults = await Promise.allSettled(
-		clients.map((client) => client.validateConfig()),
+		clients.map((client) => client.validateConfig({ healthOnly: true })),
 	);
 
 	validationResults.forEach((result, index) => {
@@ -465,30 +507,46 @@ export async function collectClientLinkingProblems(): Promise<Problem[]> {
 		"If you have multiple drives, add extra linkDirs or blocklist categories, tags, or trackers for those drives. https://www.cross-seed.org/docs/tutorials/linking#setting-up-linking";
 
 	for (const client of clients) {
-		let searchees: SearcheeWithInfoHash[];
+		let savePaths: string[];
 		try {
-			const result = await client.getClientSearchees({
-				includeFiles: false,
-				includeTrackers: false,
-			});
-			searchees = result.searchees;
+			if (client.getHealthSavePaths) {
+				savePaths = await client.getHealthSavePaths();
+			} else {
+				const result = await client.getClientSearchees({
+					includeFiles: false,
+					includeTrackers: false,
+				});
+				savePaths = result.searchees
+					.map((searchee) => searchee.savePath)
+					.filter((savePath): savePath is string =>
+						Boolean(savePath),
+					);
+			}
 		} catch (error) {
 			logger.debug({
 				label: client.label,
 				message: `Failed to inspect save paths for linking health check: ${error instanceof Error ? error.message : String(error ?? "")}`,
 			});
+			problems.push({
+				id: clientProblemId("linking-inspection", client.label),
+				severity: "error",
+				summary: `${client.label} save paths could not be inspected.`,
+				details:
+					error instanceof Error
+						? error.message
+						: String(error ?? ""),
+				metadata: {
+					client: client.label,
+					clientType: client.clientType,
+					clientHost: client.clientHost,
+					readonly: client.readonly,
+					issue: "inspection-failed",
+				},
+			});
 			continue;
 		}
 
-		const uniqueSavePaths = Array.from(
-			new Set(
-				searchees
-					.map((searchee) => searchee.savePath)
-					.filter((savePath): savePath is string =>
-						Boolean(savePath),
-					),
-			),
-		);
+		const uniqueSavePaths = Array.from(new Set(savePaths.filter(Boolean)));
 		if (!uniqueSavePaths.length) continue;
 
 		for (const [index, savePath] of uniqueSavePaths.entries()) {

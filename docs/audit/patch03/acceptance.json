@@ -1,0 +1,31 @@
+{
+	"node": "v26.11.1",
+	"baselineCommit": "8a0c428edb9f8439e5138261047d2d0e3b3a4b78",
+	"candidateSourceSha256": "477ca12c058816b98af9aa3374d71731d82debe2934db06131c87cc7dbcf8299",
+	"candidateCompiledSha256": "63d8ce55d30024127cbb6190e8edfc8e638d7d6304638a19922a501a5a105263",
+	"lockSha256": "88da27532b3b03440bbae2726942de02d7cff581b83be9374410e2426a5b285d",
+	"sourceIdentity": "Frozen working source; commit/head pinned separately by controller.",
+	"commands": {
+		"npm test": "pass (91 workspace tests, including 26 focused file-matching tests and the 160-file hardlink integration)",
+		"npm run build": "pass",
+		"npm run typecheck": "pass; backend typecheck repeated after final test-only additions",
+		"npm run lint": "pass; final test file lint checked separately",
+		"npm run format:check": "pass; final summary formatting checked separately",
+		"compiled differential": "pass (120120 helper + 4644 assessment comparisons; 144 independently asserted finite assessments)"
+	},
+	"benchmark": {
+		"assessmentTimingCyclesABA": 12,
+		"helperTimingCyclesABA": 20,
+		"allocationCyclesABA": 3,
+		"rawLocation": "External results/review-followup/matching; controller evidence bundle links in README.",
+		"relativeFivePercentGate": "NOT A CLEAN PASS; standalone unique10k early size/name +328%, native1k early rejection residual and small/noisy cases retained.",
+		"weightedScope": "Synthetic sensitivity scenarios only; cache histograms do not prove invocation frequency or overall CPU."
+	},
+	"limitations": [
+		"Standalone helper and full assessment results differ because the assessment can share the first-size rejection proof.",
+		"Native TrueNAS unique1k early assessment rejection p50 rises from A1/A2 mean15.94us to25.39us.",
+		"Tied10k exact sampled allocation rises about0.916MB to1.766MB; sampled V8 allocation excludes typed buffer backing bytes.",
+		"No live tracker or production client mutation; NFS and actual invocation frequencies remain unmeasured.",
+		"Historical tracked package/regression summaries moved to external evidence; current clean package CI handled by controller."
+	]
+}

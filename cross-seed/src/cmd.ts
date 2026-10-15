@@ -97,10 +97,16 @@ program
 	.action(
 		withMinimalRuntime(async () => {
 			console.log("Clearing client cache...");
-			await db("torrent").del();
-			await db("client_searchee").del();
-			await db("data").del();
-			await db("ensemble").del();
+			await db.transaction(async (trx) => {
+				await trx("torrent").del();
+				await trx("client_searchee").del();
+				await trx("data").del();
+				await trx("ensemble_membership").del();
+				await trx("source_origin").update({
+					state: "removed",
+					revision: trx.raw("revision + 1"),
+				});
+			});
 		}),
 	);
 

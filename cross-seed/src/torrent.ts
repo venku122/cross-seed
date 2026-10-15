@@ -1,13 +1,14 @@
+import type { Knex } from "knex";
+import { writeEnsembleTorrentEntries } from "./ensembleWriter.js";
 import { distance } from "fastest-levenshtein";
 import bencode from "bencode";
 import { readdir, readFile, stat } from "fs/promises";
-import { extname, join, resolve } from "path";
+import { extname, join, resolve, relative } from "path";
 import { inspect } from "util";
 import {
 	getClients,
 	TorrentMetadataInClient,
 } from "./clients/TorrentClient.js";
-import { isChildPath } from "./utils.js";
 import {
 	ALL_PARENTHESES_REGEX,
 	ALL_SPACES_REGEX,
@@ -21,11 +22,28 @@ import {
 } from "./constants.js";
 import {
 	getDataByFuzzyName,
+	enabledDataEntriesQuery,
 	indexDataDirs,
 	shouldIgnorePathHeuristically,
 } from "./dataFiles.js";
 import { db } from "./db.js";
-import { Label, logger, logOnce } from "./logger.js";
+import {
+	ensureSourceNamespace,
+	resolveSourceOrigin,
+	findSourceOrigin,
+	normalizeSourceLocator,
+	clientSourceLocator,
+	tombstoneSourceOrigin,
+	type SourceOrigin,
+} from "./sourceStore.js";
+import { invalidateHealth } from "./healthGeneration.js";
+import {
+	beginClientCacheOperation,
+	completeClientCacheSnapshot,
+	releaseClientCacheOperation,
+	ClientCacheConcurrencyError,
+} from "./clientCachePublication.js";
+import { Label, logger } from "./logger.js";
 import {
 	Metafile,
 	TorrentMetadata,
@@ -54,9 +72,7 @@ import {
 	exists,
 	filterAsync,
 	filterAsyncYield,
-	flatMapAsync,
 	getLogString,
-	inBatches,
 	errorMessage,
 	mapAsync,
 	Mutex,
@@ -432,7 +448,7 @@ export async function cacheEnsembleTorrentEntry(
 	torrentSavePaths?: Map<string, string>,
 ): Promise<EnsembleEntry[] | null> {
 	const ensemblePieces = createEnsemblePieces(searchee.title, searchee.files);
-	if (!ensemblePieces || !ensemblePieces.length) return null;
+	if (!ensemblePieces || !ensemblePieces.length) return [];
 
 	let savePath: string | undefined;
 	if (searchee.savePath) {
@@ -469,218 +485,218 @@ export async function cacheEnsembleTorrentEntry(
 }
 
 async function indexTorrents(options: { startup: boolean }): Promise<void> {
-	const { seasonFromEpisodes, torrentDir, useClientTorrents } =
-		getRuntimeConfig();
-	if (!useClientTorrents && !torrentDir) return;
-	const clients = getClients();
-	let searchees: SearcheeWithInfoHash[];
-	let infoHashPathMap: Map<string, string> | undefined;
-
-	if (options.startup) {
-		if (torrentDir) {
-			logger.info({
-				label: Label.INDEX,
-				message: "Indexing torrentDir for reverse lookup...",
+	const { torrentDir, useClientTorrents } = getRuntimeConfig();
+	if (torrentDir) {
+		try {
+			await refreshTorrentDirectory(torrentDir);
+		} catch (error) {
+			if (!isRecoverableTorrentDirError(error)) throw error;
+			logRecoverableTorrentDirError(torrentDir, error);
+		}
+		return;
+	}
+	if (!useClientTorrents) return;
+	for (const client of getClients()) {
+		try {
+			await client.getClientSearchees({
+				newSearcheesOnly: !options.startup,
+				includeFiles: true,
+				includeTrackers: true,
 			});
-			try {
-				searchees = await loadTorrentDirLight(torrentDir);
-			} catch (error) {
-				if (!isRecoverableTorrentDirError(error)) throw error;
-				logRecoverableTorrentDirError(torrentDir, error);
-				searchees = [];
+		} catch (error) {
+			logger.warn({
+				label: client.label,
+				message: `Indexing client torrents failed; disabling client until next retry: ${errorMessage(error)}`,
+			});
+			logger.debug(error);
+		}
+	}
+}
+
+/** Own the namespace lease before enumeration, through publication and validated pruning. */
+export async function refreshTorrentDirectory(dir: string): Promise<boolean> {
+	for (let attempt = 0; attempt < 3; attempt++) {
+		const result = await refreshTorrentDirectoryOnce(dir);
+		if (result !== "concurrent") return result;
+	}
+	throw new ClientCacheConcurrencyError();
+}
+async function refreshTorrentDirectoryOnce(
+	dir: string,
+): Promise<boolean | "concurrent"> {
+	const namespaceId = await ensureSourceNamespace(
+		db,
+		"torrent-directory",
+		dir,
+	);
+	const lease = beginClientCacheOperation(`filesystem:${namespaceId}`);
+	try {
+		const files = await findAllTorrentFilesInDir(dir);
+		// Empty network directories and inaccessible catalogs are not removal authority.
+		if (!files.length) return false;
+		const searchees: SearcheeWithInfoHash[] = [];
+		let validated = true;
+		for (const filePath of files) {
+			const origin = await findSourceOrigin(
+				db,
+				namespaceId,
+				relative(dir, filePath),
+			);
+			const result = await createSearcheeFromTorrentFile(filePath, []);
+			if (result.isErr()) {
+				validated = false;
+				continue;
 			}
-			if (clients.length) {
-				infoHashPathMap = await clients[0].getAllDownloadDirs({
+			searchees.push({
+				...result.unwrap(),
+				torrentFilePath: filePath,
+				sourceOriginId: origin?.id,
+				sourceRevision: origin?.revision ?? 0,
+			});
+		}
+		const client = getClients()[0];
+		const savePaths = client
+			? await client.getAllDownloadDirs({
 					metas: searchees,
 					onlyCompleted: false,
 					v1HashOnly: true,
-				});
-			}
-		} else {
-			logger.info("Indexing client torrents for reverse lookup...");
-			searchees = await flatMapAsync(clients, async (client) => {
-				try {
-					const { searchees } = await client.getClientSearchees({
-						includeFiles: true,
-						includeTrackers: true,
-					});
-					return searchees;
-				} catch (e) {
-					const message =
-						e instanceof Error ? e.message : String(e ?? "");
-					logger.warn({
-						label: client.label,
-						message: `Indexing client torrents failed; disabling client until next retry: ${message}`,
-					});
-					logger.debug(e);
-					return [];
-				}
-			});
-		}
-	} else {
-		if (torrentDir) {
-			try {
-				searchees = await indexTorrentDir(torrentDir);
-			} catch (error) {
-				if (!isRecoverableTorrentDirError(error)) throw error;
-				logRecoverableTorrentDirError(torrentDir, error);
-				searchees = [];
-			}
-		} else {
-			searchees = await flatMapAsync(clients, async (client) => {
-				try {
-					return (
-						await client.getClientSearchees({
-							newSearcheesOnly: true,
-							includeFiles: true,
-							includeTrackers: true,
-						})
-					).newSearchees;
-				} catch (e) {
-					const message =
-						e instanceof Error ? e.message : String(e ?? "");
-					logger.warn({
-						label: client.label,
-						message: `Indexing client torrents failed; disabling client until next retry: ${message}`,
-					});
-					logger.debug(e);
-					return [];
-				}
-			});
-		}
+				})
+			: new Map<string, string>();
+		const { seasonFromEpisodes } = getRuntimeConfig();
+		const publication = await writeEnsembleTorrentEntries(
+			searchees,
+			(source) =>
+				seasonFromEpisodes
+					? cacheEnsembleTorrentEntry(source, savePaths)
+					: Promise.resolve([]),
+			lease,
+		);
+		// Compatibility file metadata commits through the same accepted publication.
+		// A failed source prevents authoritative removal of any absent source.
+		if (!validated || publication.unavailable) return false;
+		if (!publication.complete) return "concurrent";
+		const seen = new Set(files.map((path) => relative(dir, path)));
+		return await completeClientCacheSnapshot(
+			lease,
+			async (trx, canRemove) => {
+				const origins = await trx<SourceOrigin>("source_origin")
+					.where({ namespace_id: namespaceId })
+					.whereNot("state", "removed");
+				const removed: string[] = [];
+				for (const origin of origins)
+					if (
+						!seen.has(origin.source_key) &&
+						canRemove(origin.source_key)
+					) {
+						if (
+							await tombstoneSourceOrigin(
+								trx,
+								origin.id,
+								origin.revision,
+								origin.revision + 1,
+							)
+						) {
+							await trx("torrent")
+								.where({
+									file_path: join(dir, origin.source_key),
+								})
+								.delete();
+							removed.push(origin.source_key);
+						}
+					}
+				return removed;
+			},
+		);
+	} finally {
+		releaseClientCacheOperation(lease);
 	}
-	if (!seasonFromEpisodes) return;
-
-	const ensembleRows = await flatMapAsync(
-		searchees,
-		async (searchee) =>
-			(await cacheEnsembleTorrentEntry(searchee, infoHashPathMap)) ?? [],
-	);
-	await inBatches(ensembleRows, async (batch) => {
-		await db("ensemble")
-			.insert(batch)
-			.onConflict(["client_host", "path"])
-			.merge();
-	});
 }
 
-async function indexTorrentDir(dir: string): Promise<SearcheeWithInfoHash[]> {
-	const dirContents = new Set(await findAllTorrentFilesInDir(dir));
-
-	const newSearchees: SearcheeWithInfoHash[] = [];
-	for (const filePath of dirContents) {
-		const doesAlreadyExist = await db("torrent")
-			.select("id")
-			.where({ file_path: filePath })
-			.first();
-		if (doesAlreadyExist) continue;
-
-		let meta: Metafile;
-		try {
-			meta = await parseTorrentFromPath(filePath);
-		} catch (e) {
-			logOnce(`Failed to parse ${filePath}`, () => {
-				logger.error({
-					label: Label.INDEX,
-					message: `Failed to parse ${filePath}`,
+export async function reconcileSourceNamespaces(): Promise<void> {
+	const { dataDirs, torrentDir, useClientTorrents } = getRuntimeConfig();
+	const configured: Record<string, string[]> = {
+		client: useClientTorrents
+			? getClients().map((client) =>
+					normalizeSourceLocator(
+						"client",
+						clientSourceLocator(client.clientHost),
+					),
+				)
+			: [],
+		"data-root": dataDirs,
+		"torrent-directory": torrentDir ? [torrentDir] : [],
+	};
+	await db.transaction(async (trx) => {
+		// A reactivated client needs a fresh remote publication. Preserve its
+		// history, but don't treat the last observed endpoint snapshot as live.
+		const reactivated = configured.client.length
+			? await trx<{
+					id: string;
+					type: string;
+					enabled: number;
+					locator: string;
+				}>("source_namespace")
+					.where({ type: "client", enabled: 0 })
+					.whereIn("locator", configured.client)
+					.select("id")
+			: [];
+		if (reactivated.length)
+			await trx("source_origin")
+				.whereIn(
+					"namespace_id",
+					reactivated.map((namespace) => namespace.id),
+				)
+				.where("state", "verified")
+				.update({
+					state: "unavailable",
+					revision: trx.raw("revision+1"),
 				});
-				logger.debug(e);
-			});
-			continue;
+		// Visibility policy does not turn unresolved history into owned sources.
+		// Named historical clients must still be configured; unnamed history is
+		// hidden when there is no configured source that can provide it.
+		const hosts = useClientTorrents
+			? getClients().map((client) => client.clientHost)
+			: [];
+		const viable =
+			hosts.length > 0 || dataDirs.length > 0 || Boolean(torrentDir);
+		await trx("source_origin")
+			.where({ namespace_id: "legacy-unknown", state: "legacy-unknown" })
+			.update({ visible: viable ? 1 : 0 });
+		const named = () =>
+			trx("source_origin")
+				.where({
+					namespace_id: "legacy-unknown",
+					state: "legacy-unknown",
+				})
+				.whereRaw(
+					"coalesce(json_extract(metadata,'$.clientHost'),'') <> ''",
+				);
+		await named().update({ visible: 0 });
+		if (hosts.length)
+			await named()
+				.whereRaw(
+					`json_extract(metadata,'$.clientHost') IN (${hosts.map(() => "?").join(",")})`,
+					hosts,
+				)
+				.update({ visible: 1 });
+		for (const [type, locators] of Object.entries(configured)) {
+			await trx("source_namespace")
+				.where({ type })
+				.update({ enabled: 0 });
+			if (locators.length)
+				await trx("source_namespace")
+					.where({ type })
+					.whereIn("locator", locators)
+					.update({ enabled: 1 });
 		}
-		await db("torrent")
-			.insert({
-				file_path: filePath,
-				info_hash: meta.infoHash,
-				name: meta.name,
-			})
-			.onConflict("file_path")
-			.ignore();
-		const res = await createSearcheeFromTorrentFile(filePath, []);
-		if (res.isOk()) newSearchees.push(res.unwrap());
-	}
-
-	const rows = await db("torrent").select("file_path", "info_hash");
-	const toDelete = rows.filter((row) => !dirContents.has(row.file_path));
-	await inBatches(toDelete, async (batch) => {
-		await db("torrent")
-			.whereIn(
-				"file_path",
-				batch.map((row) => row.file_path),
-			)
-			.del();
-		await db("ensemble")
-			.whereIn(
-				"info_hash",
-				batch.map((row) => row.info_hash),
-			)
-			.del();
 	});
-
-	return newSearchees;
+	invalidateHealth();
 }
 
 export async function indexTorrentsAndDataDirs(
 	options = { startup: false },
 ): Promise<void> {
-	if (options.startup) {
-		const { dataDirs, seasonFromEpisodes, torrentDir, useClientTorrents } =
-			getRuntimeConfig();
-		if (!useClientTorrents) {
-			const hashes = (
-				await db<{ info_hash: string }>("client_searchee").select(
-					"info_hash",
-				)
-			).map((r) => r.info_hash);
-			await inBatches(hashes, async (batch) => {
-				await db("ensemble").whereIn("info_hash", batch).del();
-			});
-			await db("client_searchee").del();
-		} else {
-			const clientHosts = getClients().map((client) => client.clientHost);
-			await db("client_searchee")
-				.whereNotIn("client_host", clientHosts)
-				.del();
-			await db("ensemble")
-				.whereNotNull("client_host")
-				.whereNotIn("client_host", clientHosts)
-				.del();
-		}
-		if (!torrentDir) {
-			const hashes = (await db("torrent").select("info_hash")).map(
-				(r) => r.info_hash,
-			);
-			await inBatches(hashes, async (batch) => {
-				await db("ensemble").whereIn("info_hash", batch).del();
-			});
-			await db("torrent").del();
-		}
-		if (!dataDirs.length) {
-			const paths = (
-				await db<{ path: string }>("data").select("path")
-			).map((r) => r.path);
-			await inBatches(paths, async (batch) => {
-				await db("ensemble")
-					.whereIn("path", batch)
-					.whereNull("client_host")
-					.del();
-			});
-			await db("data").del();
-		} else {
-			const paths = (
-				await db<{ path: string }>("data").select("path")
-			).map((r) => r.path);
-			const toDelete = paths.filter((p) => !isChildPath(p, dataDirs));
-			await inBatches(toDelete, async (batch) => {
-				await db("data").whereIn("path", batch).del();
-				await db("ensemble")
-					.whereIn("path", batch)
-					.whereNull("client_host")
-					.del();
-			});
-		}
-		if (!seasonFromEpisodes) await db("ensemble").del();
-	}
+	if (options.startup) await reconcileSourceNamespaces();
 	return withMutex(
 		Mutex.INDEX_TORRENTS_AND_DATA_DIRS,
 		{ useQueue: false },
@@ -709,19 +725,166 @@ export async function indexTorrentsAndDataDirs(
 	);
 }
 
+function enabledClientEntriesQuery(): Knex.QueryBuilder<
+	ClientSearcheeRow,
+	ClientSearcheeRow[]
+> {
+	const clients = getClients();
+	return db<ClientSearcheeRow>("client_searchee as cache")
+		.select<ClientSearcheeRow[]>("cache.*")
+		.where((builder) => {
+			if (!clients.length) {
+				builder.whereRaw("0");
+				return;
+			}
+			for (const client of clients)
+				builder.orWhere((owner) => {
+					const locator = normalizeSourceLocator(
+						"client",
+						clientSourceLocator(client.clientHost),
+					);
+					owner
+						.where("cache.client_host", client.clientHost)
+						.andWhere((visible) => {
+							visible.whereExists(
+								db("source_alias as alias")
+									.join(
+										"source_origin as origin",
+										"origin.id",
+										"alias.origin_id",
+									)
+									.join(
+										"source_namespace as namespace",
+										"namespace.id",
+										"origin.namespace_id",
+									)
+									.select(db.raw("1"))
+									.where("namespace.type", "client")
+									.where("namespace.locator", locator)
+									.where("namespace.enabled", 1)
+									.whereRaw(
+										"namespace.id=cache.source_namespace_id",
+									)
+									.where("origin.state", "verified")
+									.whereRaw("alias.alias=cache.info_hash"),
+							);
+							visible.orWhere((unresolved) => {
+								unresolved.whereNull(
+									"cache.source_namespace_id",
+								);
+								unresolved.whereNotExists(
+									db("source_namespace as namespace")
+										.select(db.raw("1"))
+										.where("namespace.type", "client")
+										.where("namespace.locator", locator),
+								);
+								// A known cache row from a previous endpoint is not
+								// unresolved provenance for the newly bound endpoint.
+								unresolved.whereNotExists(
+									db("source_alias as alias")
+										.join(
+											"source_origin as origin",
+											"origin.id",
+											"alias.origin_id",
+										)
+										.join(
+											"source_namespace as namespace",
+											"namespace.id",
+											"origin.namespace_id",
+										)
+										.select(db.raw("1"))
+										.where("namespace.type", "client")
+										.whereRaw("alias.alias=cache.info_hash")
+										.whereRaw(
+											"json_extract(origin.metadata,'$.clientHost')=cache.client_host",
+										),
+								);
+							});
+						});
+				});
+		});
+}
+function enabledTorrentEntriesQuery(): Knex.QueryBuilder<
+	{ file_path: string; info_hash: string; name: string },
+	{ file_path: string; info_hash: string; name: string }[]
+> {
+	const { torrentDir } = getRuntimeConfig();
+	// Unary + removes outer TEXT affinity for indexed JSON string path comparisons.
+	return db<{ file_path: string; info_hash: string; name: string }>(
+		"torrent as cache",
+	)
+		.select<{ file_path: string; info_hash: string; name: string }[]>(
+			"cache.*",
+		)
+		.where((builder) => {
+			if (!torrentDir) {
+				builder.whereRaw("0");
+				return;
+			}
+			builder.whereExists(
+				db("source_origin as origin")
+					.join(
+						"source_namespace as namespace",
+						"namespace.id",
+						"origin.namespace_id",
+					)
+					.select(db.raw("1"))
+					.where("namespace.type", "torrent-directory")
+					.where("namespace.locator", torrentDir)
+					.where("namespace.enabled", 1)
+					.where("origin.state", "verified")
+					.whereRaw(
+						"json_extract(origin.metadata,'$.torrentFilePath')=+cache.file_path",
+					),
+			);
+			builder.orWhere((unknown) => {
+				unknown.whereNotExists(
+					db("source_origin as origin")
+						.join(
+							"source_namespace as namespace",
+							"namespace.id",
+							"origin.namespace_id",
+						)
+						.select(db.raw("1"))
+						.where("namespace.type", "torrent-directory")
+						.whereRaw(
+							"json_extract(origin.metadata,'$.torrentFilePath')=+cache.file_path",
+						),
+				);
+				const root = torrentDir.replace(/\/+$/, "");
+				unknown.whereRaw("substr(cache.file_path,1,?)=?", [
+					root.length + 1,
+					`${root}/`,
+				]);
+				unknown.whereNotExists(
+					db("source_namespace as namespace")
+						.select(db.raw("1"))
+						.where("namespace.type", "torrent-directory")
+						.where("namespace.locator", torrentDir)
+						.where("namespace.enabled", 0),
+				);
+			});
+		});
+}
+
 export async function getInfoHashesToExclude(): Promise<Set<string>> {
-	const { useClientTorrents } = getRuntimeConfig();
-	const database = useClientTorrents
-		? db<{ info_hash: string }>("client_searchee")
-		: db<{ info_hash: string }>("torrent");
+	if (getRuntimeConfig().useClientTorrents)
+		return new Set(
+			(await enabledClientEntriesQuery()).map((row) => row.info_hash),
+		);
 	return new Set(
-		(await database.select("info_hash")).map((e) => e.info_hash),
+		(await enabledTorrentEntriesQuery()).map((row) => row.info_hash),
 	);
 }
 
 export async function loadTorrentDirLight(
 	torrentDir: string,
 ): Promise<SearcheeWithInfoHash[]> {
+	const namespaceId = await ensureSourceNamespace(
+		db,
+		"torrent-directory",
+		torrentDir,
+	);
 	const torrentFilePaths = await findAllTorrentFilesInDir(torrentDir);
 
 	const searchees: SearcheeWithInfoHash[] = [];
@@ -731,12 +894,22 @@ export async function loadTorrentDirLight(
 			? await client.getAllTorrents()
 			: [];
 	for (const torrentFilePath of torrentFilePaths) {
+		const origin = await resolveSourceOrigin(
+			db,
+			namespaceId,
+			relative(torrentDir, torrentFilePath),
+		);
 		const searcheeResult = await createSearcheeFromTorrentFile(
 			torrentFilePath,
 			torrentInfos,
 		);
 		if (searcheeResult.isOk()) {
-			searchees.push(searcheeResult.unwrap());
+			searchees.push({
+				...searcheeResult.unwrap(),
+				torrentFilePath,
+				sourceRevision: origin?.revision ?? 0,
+				sourceOriginId: origin?.id,
+			});
 		}
 	}
 	return searchees;
@@ -831,13 +1004,13 @@ export async function getSimilarByName(name: string): Promise<{
 
 	if (useClientTorrents) {
 		clientSearchees.push(
-			...(await filterEntries(await db("client_searchee"))).map(
+			...(await filterEntries(await enabledClientEntriesQuery())).map(
 				createSearcheeFromDB,
 			),
 		);
 	} else if (torrentDir) {
 		const filteredTorrentEntries = (await filterEntries(
-			await db("torrent").select("name", "file_path"),
+			await enabledTorrentEntriesQuery(),
 		)) as { name: string; file_path: string }[];
 		if (filteredTorrentEntries.length) {
 			const client = getClients()[0];
@@ -862,7 +1035,7 @@ export async function getSimilarByName(name: string): Promise<{
 
 	const entriesToDelete: string[] = [];
 	const filteredDataEntries = await filterAsync(
-		(await filterEntries(await db("data"))) as {
+		(await filterEntries(await enabledDataEntriesQuery())) as {
 			title: string;
 			path: string;
 		}[],
@@ -880,10 +1053,7 @@ export async function getSimilarByName(name: string): Promise<{
 			return true;
 		},
 	);
-	await inBatches(entriesToDelete, async (batch) => {
-		await db("data").whereIn("path", batch).del();
-		await db("ensemble").whereIn("path", batch).del();
-	});
+	void entriesToDelete;
 	if (filteredDataEntries.length) {
 		dataSearchees.push(
 			...(
@@ -907,8 +1077,8 @@ async function getTorrentByFuzzyName(
 	const { useClientTorrents } = getRuntimeConfig();
 
 	const database: TorrentEntry[] = useClientTorrents
-		? await db("client_searchee")
-		: await db("torrent");
+		? await enabledClientEntriesQuery()
+		: await enabledTorrentEntriesQuery();
 	const fullMatch = createKeyTitle(stem);
 
 	// Attempt to filter torrents in DB to match incoming data before fuzzy check
@@ -958,8 +1128,8 @@ export async function getTorrentByCriteria(
 ): Promise<SearcheeWithInfoHash[]> {
 	const { useClientTorrents } = getRuntimeConfig();
 	const database = useClientTorrents
-		? db<ClientSearcheeRow>("client_searchee")
-		: db<{ file_path: string; info_hash: string }>("torrent");
+		? enabledClientEntriesQuery()
+		: enabledTorrentEntriesQuery();
 	const dbTorrents = await database.where((b) =>
 		b.where({ info_hash: criteria.infoHash }),
 	);

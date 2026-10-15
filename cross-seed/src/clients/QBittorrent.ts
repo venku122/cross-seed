@@ -1,3 +1,15 @@
+import {
+	bindClientSourceLocator,
+	normalizeSourceLocator,
+} from "../sourceStore.js";
+import {
+	beginClientCacheOperation,
+	releaseClientCacheOperation,
+	isClientCacheOperationCurrent,
+	ClientCacheConcurrencyError,
+	type ClientCacheLease,
+} from "../clientCachePublication.js";
+import { cachedClientTorrents } from "./clientCache.js";
 import { readdir } from "fs/promises";
 import ms from "ms";
 import path from "path";
@@ -11,14 +23,12 @@ import {
 	TORRENT_TAG,
 	USER_AGENT,
 } from "../constants.js";
-import { db } from "../db.js";
 import { CrossSeedError } from "../errors.js";
 import { Label, logger } from "../logger.js";
 import { Metafile } from "../parseTorrent.js";
 import { Result, resultOf, resultOfErr } from "../Result.js";
 import { getRuntimeConfig } from "../runtimeConfig.js";
 import {
-	ClientSearcheeRow,
 	createSearcheeFromDB,
 	File,
 	parseTitle,
@@ -26,6 +36,7 @@ import {
 	SearcheeClient,
 	SearcheeWithInfoHash,
 	updateSearcheeClientDB,
+	upsertSearcheeClientDB,
 } from "../searchee.js";
 import {
 	errorMessage,
@@ -50,6 +61,32 @@ import {
 	TorrentMetadataInClient,
 } from "./TorrentClient.js";
 
+interface AliasCatalogRead {
+	promise: Promise<TorrentInfo[]>;
+	lease: ClientCacheLease;
+	consumers: number;
+}
+interface ScopedRefreshContext {
+	canonicalHash?: string;
+}
+interface ClientRefreshOptions {
+	newSearcheesOnly?: boolean;
+	refresh?: string[];
+	includeFiles?: boolean;
+	includeTrackers?: boolean;
+}
+function torrentFingerprint(value: TorrentInfo): string {
+	return JSON.stringify([
+		value.hash,
+		value.infohash_v1,
+		value.infohash_v2,
+		value.name,
+		value.save_path,
+		value.total_size,
+		value.category,
+		value.tags,
+	]);
+}
 const X_WWW_FORM_URLENCODED = {
 	"Content-Type": "application/x-www-form-urlencoded",
 };
@@ -180,6 +217,7 @@ interface CategoryInfo {
 
 export default class QBittorrent implements TorrentClient {
 	cookie: string;
+	private healthLogin: Promise<void> | undefined;
 	url: { username: string; password: string; href: string };
 	version: string;
 	versionMajor: number;
@@ -190,6 +228,13 @@ export default class QBittorrent implements TorrentClient {
 	readonly clientType = Label.QBITTORRENT;
 	readonly readonly: boolean;
 	readonly label: string;
+	private readonly refreshes = new Map<
+		string,
+		Promise<SearcheeClient | undefined>
+	>();
+	private aliasCatalog?: AliasCatalogRead;
+
+	private readonly sourceLocator: string;
 
 	constructor(
 		url: string,
@@ -197,6 +242,8 @@ export default class QBittorrent implements TorrentClient {
 		priority: number,
 		readonly: boolean,
 	) {
+		this.sourceLocator = normalizeSourceLocator("client", url);
+		bindClientSourceLocator(clientHost, url);
 		this.clientHost = clientHost;
 		this.clientPriority = priority;
 		this.readonly = readonly;
@@ -208,7 +255,19 @@ export default class QBittorrent implements TorrentClient {
 		);
 	}
 
-	async login(): Promise<void> {
+	async login(healthOnly = false): Promise<void> {
+		if (!healthOnly) return this.performLogin(false);
+		if (this.healthLogin) return this.healthLogin;
+		const pending = this.performLogin(true);
+		this.healthLogin = pending;
+		try {
+			await pending;
+		} finally {
+			if (this.healthLogin === pending) this.healthLogin = undefined;
+		}
+	}
+
+	private async performLogin(healthOnly: boolean): Promise<void> {
 		let response: Response;
 		const { href, username, password } = this.url;
 		try {
@@ -240,12 +299,26 @@ export default class QBittorrent implements TorrentClient {
 			"/app/version",
 			"",
 			X_WWW_FORM_URLENCODED,
+			healthOnly ? 1 : 3,
+			healthOnly,
+			// A health handshake cannot rejoin its own shared login promise.
+			!healthOnly,
 		);
 		if (!version) {
 			throw new CrossSeedError(
 				`qBittorrent login failed: Unable to retrieve version`,
 			);
 		}
+		this.checkVersion(version, healthOnly);
+		logger.info({
+			label: this.label,
+			message: `Logged in to ${this.version} successfully${this.readonly ? " (readonly)" : ""}`,
+		});
+	}
+
+	private checkVersion(version: string, healthOnly = false): void {
+		if (healthOnly && !/^v?\d+\.\d+\.\d+/i.test(version))
+			throw new CrossSeedError("Unable to retrieve qBittorrent version");
 		this.version = version;
 		this.versionMajor = extractInt(this.version);
 		this.versionMinor = extractInt(this.version.split(".")[1]);
@@ -261,23 +334,36 @@ export default class QBittorrent implements TorrentClient {
 				`qBittorrent minimum supported version is v4.3.1, current version is ${this.version}`,
 			);
 		}
-		logger.info({
-			label: this.label,
-			message: `Logged in to ${this.version} successfully${this.readonly ? " (readonly)" : ""}`,
-		});
 	}
 
-	async validateConfig(): Promise<void> {
+	async validateConfig(options?: { healthOnly?: boolean }): Promise<void> {
 		const { torrentDir } = getRuntimeConfig();
 		try {
-			await this.login();
+			if (!options?.healthOnly || !this.cookie) {
+				await this.login(Boolean(options?.healthOnly));
+			} else {
+				const version = await this.request(
+					"/app/version",
+					"",
+					X_WWW_FORM_URLENCODED,
+					1,
+					true,
+				);
+				if (!version)
+					throw new CrossSeedError(
+						"Unable to retrieve qBittorrent version",
+					);
+				this.checkVersion(version, true);
+			}
 		} catch (e) {
 			throw new CrossSeedError(`[${this.label}] ${errorMessage(e)}`);
 		}
-		await this.createTag();
+		if (!options?.healthOnly) await this.createTag();
 
 		if (!torrentDir) return;
-		const { resume_data_storage_type } = await this.getPreferences();
+		const { resume_data_storage_type } = await this.getPreferences(
+			Boolean(options?.healthOnly),
+		);
 		if (resume_data_storage_type === "SQLite") {
 			throw new CrossSeedError(
 				`[${this.label}] torrentDir is not compatible with SQLite mode in qBittorrent, use https://www.cross-seed.org/docs/basics/options#useclienttorrents`,
@@ -297,6 +383,8 @@ export default class QBittorrent implements TorrentClient {
 		body: BodyInit,
 		headers: Record<string, string> = {},
 		numRetries = 3,
+		requireSuccess = false,
+		allowReauth = true,
 	): Promise<string | undefined> {
 		const bodyStr =
 			body instanceof URLSearchParams || body instanceof FormData
@@ -315,10 +403,11 @@ export default class QBittorrent implements TorrentClient {
 					label: this.label,
 					message: `Making request (${retries - i}) to ${path} with body ${bodyStr}`,
 				});
+				const requestCookie = this.cookie;
 				response = await fetch(`${this.url.href}${path}`, {
 					method: "POST",
 					headers: {
-						Cookie: this.cookie,
+						Cookie: requestCookie,
 						"User-Agent": USER_AGENT,
 						...headers,
 					},
@@ -326,7 +415,7 @@ export default class QBittorrent implements TorrentClient {
 					signal: AbortSignal.timeout(ms("10 minutes")),
 				});
 				if (response.status === 403) {
-					if (i >= retries) {
+					if (!allowReauth || i >= retries) {
 						logger.error({
 							label: this.label,
 							message: `Received 403 from API after ${retries} retries`,
@@ -337,7 +426,8 @@ export default class QBittorrent implements TorrentClient {
 						label: this.label,
 						message: `Received 403 from API, re-authenticating and retrying (${retries - i} retries left)`,
 					});
-					await this.login();
+					if (!requireSuccess || this.cookie === requestCookie)
+						await this.login(requireSuccess);
 					await wait(
 						Math.min(ms("1 second") * 2 ** i, ms("10 seconds")),
 					);
@@ -378,14 +468,21 @@ export default class QBittorrent implements TorrentClient {
 				continue;
 			}
 		}
+		if (requireSuccess && !response?.ok) {
+			throw new CrossSeedError(
+				`[${this.label}] Metadata or health request failed with code ${response?.status ?? "transport error"}`,
+			);
+		}
 		return response?.text();
 	}
 
-	async getPreferences(): Promise<Preferences> {
+	async getPreferences(healthOnly = false): Promise<Preferences> {
 		const responseText = await this.request(
 			"/app/preferences",
 			"",
 			X_WWW_FORM_URLENCODED,
+			healthOnly ? 1 : 3,
+			healthOnly,
 		);
 		if (!responseText) {
 			throw new CrossSeedError(
@@ -691,6 +788,39 @@ export default class QBittorrent implements TorrentClient {
 		return JSON.parse(responseText) as TorrentInfo[];
 	}
 
+	/** Read save paths for status without hydrating or mutating cached metadata. */
+	async getHealthSavePaths(): Promise<string[]> {
+		if (!this.cookie) await this.login(true);
+		const response = await this.request(
+			"/torrents/info",
+			new URLSearchParams(),
+			{},
+			1,
+			true,
+		);
+		if (!response)
+			throw new CrossSeedError(
+				"qBittorrent returned no save-path information",
+			);
+		const torrents: unknown = JSON.parse(response);
+		if (
+			!Array.isArray(torrents) ||
+			torrents.some(
+				(torrent: unknown) =>
+					!torrent ||
+					typeof torrent !== "object" ||
+					!("save_path" in torrent) ||
+					typeof torrent.save_path !== "string",
+			)
+		)
+			throw new CrossSeedError(
+				"qBittorrent returned invalid save-path information",
+			);
+		return (torrents as { save_path: string }[]).map(
+			(torrent) => torrent.save_path,
+		);
+	}
+
 	/*
 	 * @param hash the hash of the torrent
 	 * @return the torrent if it exists
@@ -749,6 +879,216 @@ export default class QBittorrent implements TorrentClient {
 		}));
 	}
 
+	/** Refresh only the requested source; absence never prunes unrelated cache rows. */
+	refreshOne(inputHash: string): Promise<SearcheeClient | undefined> {
+		const hash = inputHash.toLowerCase();
+		const existing = this.refreshes.get(hash);
+		if (existing) return existing;
+		const pending = this.refreshOneOrdered(hash).finally(() =>
+			this.refreshes.delete(hash),
+		);
+		this.refreshes.set(hash, pending);
+		return pending;
+	}
+
+	private async refreshOneOrdered(
+		hash: string,
+	): Promise<SearcheeClient | undefined> {
+		const context: ScopedRefreshContext = {};
+		for (let attempt = 0; attempt < 3; attempt++) {
+			try {
+				return await this.refreshOneUncached(hash, context);
+			} catch (error) {
+				if (!(error instanceof ClientCacheConcurrencyError))
+					throw error;
+			}
+		}
+		throw new ClientCacheConcurrencyError();
+	}
+
+	private async metadataRequest<T>(
+		route: string,
+		params: URLSearchParams,
+	): Promise<T> {
+		const text = await this.request(route, params, {}, 3, true);
+		if (!text)
+			throw new CrossSeedError(`[${this.label}] Empty metadata response`);
+		const value: unknown = JSON.parse(text);
+		if (!Array.isArray(value))
+			throw new CrossSeedError(
+				`[${this.label}] Invalid metadata response`,
+			);
+		return value as T;
+	}
+
+	private getAliasCatalogRead(): AliasCatalogRead {
+		if (this.aliasCatalog) return this.aliasCatalog;
+		const lease = beginClientCacheOperation(this.clientHost);
+		if (lease.sourceLocator !== this.sourceLocator) {
+			releaseClientCacheOperation(lease);
+			throw new Error("Client configuration changed during refresh");
+		}
+		const read: AliasCatalogRead = {
+			lease,
+			consumers: 0,
+			promise: this.metadataRequest<TorrentInfo[]>(
+				"/torrents/info",
+				new URLSearchParams(),
+			),
+		};
+		read.promise = read.promise.finally(() => {
+			if (this.aliasCatalog === read) this.aliasCatalog = undefined;
+		});
+		this.aliasCatalog = read;
+		return read;
+	}
+
+	private async refreshOneUncached(
+		hash: string,
+		context: ScopedRefreshContext,
+	): Promise<SearcheeClient | undefined> {
+		let lease = beginClientCacheOperation(this.clientHost);
+		try {
+			if (lease.sourceLocator !== this.sourceLocator)
+				throw new Error("Client configuration changed during refresh");
+			const matches = (torrent: TorrentInfo) =>
+				[torrent.hash, torrent.infohash_v1, torrent.infohash_v2].some(
+					(alias) => alias?.toLowerCase() === hash,
+				);
+			const targeted = await this.metadataRequest<TorrentInfo[]>(
+				"/torrents/info",
+				new URLSearchParams({
+					hashes: context.canonicalHash ?? hash,
+					includeFiles: "true",
+					includeTrackers: "true",
+				}),
+			);
+			let torrent = targeted.find(matches);
+			if (!torrent) {
+				// The shared catalog supplies identity hints, never publishable placement.
+				// Its negative results retain the lease captured before that actual RPC.
+				const read = this.getAliasCatalogRead();
+				read.consumers++;
+				try {
+					torrent = (await read.promise).find(matches);
+					if (!torrent) {
+						if (
+							!(await isClientCacheOperationCurrent(
+								read.lease,
+								hash,
+							))
+						)
+							throw new ClientCacheConcurrencyError();
+						return undefined;
+					}
+					context.canonicalHash = torrent.hash;
+				} finally {
+					if (--read.consumers === 0)
+						releaseClientCacheOperation(read.lease);
+				}
+				releaseClientCacheOperation(lease);
+				lease = beginClientCacheOperation(this.clientHost);
+				if (lease.sourceLocator !== this.sourceLocator)
+					throw new Error(
+						"Client configuration changed during refresh",
+					);
+				torrent = (
+					await this.metadataRequest<TorrentInfo[]>(
+						"/torrents/info",
+						new URLSearchParams({
+							hashes: context.canonicalHash,
+							includeFiles: "true",
+							includeTrackers: "true",
+						}),
+					)
+				).find(matches);
+			}
+			if (torrent) context.canonicalHash = torrent.hash;
+
+			if (!torrent) {
+				if (!(await isClientCacheOperationCurrent(lease, hash)))
+					throw new ClientCacheConcurrencyError();
+				return undefined;
+			}
+			const files = (
+				torrent.files ??
+				(await this.metadataRequest<TorrentFile[]>(
+					"/torrents/files",
+					new URLSearchParams({ hash: torrent.hash }),
+				))
+			).map((f) => this.torrentFileToFile(f));
+			if (!files.length)
+				throw new CrossSeedError(
+					`[${this.label}] No source files found during metadata refresh`,
+				);
+			const trackers = organizeTrackers(
+				torrent.trackers ??
+					(await this.metadataRequest<TorrentTracker[]>(
+						"/torrents/trackers",
+						new URLSearchParams({ hash: torrent.hash }),
+					)),
+			);
+			if (!(await isClientCacheOperationCurrent(lease, hash)))
+				throw new ClientCacheConcurrencyError();
+			if (!torrent.files || !torrent.trackers) {
+				// Older qB versions hydrate these with independent RPCs. Validate the
+				// source placement again before joining their details with the first read.
+				const current = (
+					await this.metadataRequest<TorrentInfo[]>(
+						"/torrents/info",
+						new URLSearchParams({ hashes: torrent.hash }),
+					)
+				).find(matches);
+				if (
+					!current ||
+					torrentFingerprint(current) !== torrentFingerprint(torrent)
+				)
+					throw new ClientCacheConcurrencyError();
+			}
+
+			const name = torrent.name;
+			const searchee: SearcheeClient = {
+				infoHash: (torrent.infohash_v1 || torrent.hash).toLowerCase(),
+				name,
+				title: parseTitle(name, files) ?? name,
+				files,
+				length: torrent.total_size,
+				clientHost: this.clientHost,
+				savePath: torrent.save_path,
+				category: torrent.category,
+				tags: torrent.tags
+					.split(",")
+					.map((tag) => tag.trim())
+					.filter(Boolean),
+				trackers,
+			};
+			if (
+				!(await upsertSearcheeClientDB(
+					[searchee],
+					lease,
+					new Map([
+						[
+							searchee.infoHash,
+							[
+								torrent.hash,
+								torrent.infohash_v1,
+								torrent.infohash_v2,
+							]
+								.filter((alias): alias is string =>
+									Boolean(alias),
+								)
+								.map((alias) => alias.toLowerCase()),
+						],
+					]),
+				))
+			)
+				throw new ClientCacheConcurrencyError();
+			return searchee;
+		} finally {
+			releaseClientCacheOperation(lease);
+		}
+	}
+
 	/**
 	 * Get all searchees from the client and update the db
 	 * @param options.newSearcheesOnly only return searchees that are not in the db
@@ -757,112 +1097,200 @@ export default class QBittorrent implements TorrentClient {
 	 * @param options.includeTrackers include trackers in the torrents info request
 	 * @return an object containing all searchees and new searchees (refreshed searchees are considered new)
 	 */
-	async getClientSearchees(options?: {
-		newSearcheesOnly?: boolean;
-		refresh?: string[];
-		includeFiles?: boolean;
-		includeTrackers?: boolean;
-	}): Promise<ClientSearcheeResult> {
-		const searchees: SearcheeClient[] = [];
-		const newSearchees: SearcheeClient[] = [];
-		const infoHashes = new Set<string>();
-		const torrents = await this.getAllTorrentInfo({
-			includeFiles: options?.includeFiles,
-			includeTrackers: options?.includeTrackers,
-		});
-		if (!torrents.length) {
-			logger.error({
-				label: this.label,
-				message: "No torrents found in client",
-			});
-			return { searchees, newSearchees };
+	async getClientSearchees(
+		options?: ClientRefreshOptions,
+	): Promise<ClientSearcheeResult> {
+		for (let attempt = 0; attempt < 3; attempt++) {
+			try {
+				return await this.getClientSearcheesUncached(options);
+			} catch (error) {
+				if (!(error instanceof ClientCacheConcurrencyError))
+					throw error;
+			}
 		}
-		for (const torrent of torrents) {
-			const infoHash = (
-				torrent.infohash_v1 || torrent.hash
-			).toLowerCase();
-			infoHashes.add(infoHash);
-			const dbTorrent = await db<ClientSearcheeRow>("client_searchee")
-				.where("info_hash", infoHash)
-				.where("client_host", this.clientHost)
-				.first();
-			const { name } = torrent;
-			const savePath = torrent.save_path;
-			const category = torrent.category;
-			const tags = torrent.tags.length
-				? torrent.tags
-						.split(",")
-						.map((tag) => tag.trim())
-						.filter((tag) => tag.length)
-				: [];
-			const modified = clientSearcheeModified(
-				this.label,
+		throw new ClientCacheConcurrencyError();
+	}
+	private async getClientSearcheesUncached(
+		options?: ClientRefreshOptions,
+	): Promise<ClientSearcheeResult> {
+		const lease = beginClientCacheOperation(this.clientHost);
+		try {
+			if (lease.sourceLocator !== this.sourceLocator)
+				throw new Error("Client configuration changed during refresh");
+			let metadataComplete = true;
+			const searchees: SearcheeClient[] = [];
+			const newSearchees: SearcheeClient[] = [];
+			const aliases = new Map<string, string[]>();
+			const infoHashes = new Set<string>();
+			const detailSnapshots: TorrentInfo[] = [];
+			const params = new URLSearchParams();
+			if (options?.includeFiles) params.set("includeFiles", "true");
+			if (options?.includeTrackers) params.set("includeTrackers", "true");
+			const torrents = await this.metadataRequest<TorrentInfo[]>(
+				"/torrents/info",
+				params,
+			);
+			for await (const {
+				torrent,
+				infoHash,
+				useCache,
 				dbTorrent,
-				name,
-				savePath,
-				{
+			} of cachedClientTorrents(
+				torrents,
+				this.clientHost,
+				(torrent) =>
+					(torrent.infohash_v1 || torrent.hash).toLowerCase(),
+				(torrent, dbTorrent, infoHash) => {
+					const { name } = torrent;
+					const savePath = torrent.save_path;
+					const category = torrent.category;
+					const tags = torrent.tags.length
+						? torrent.tags
+								.split(",")
+								.map((tag) => tag.trim())
+								.filter((tag) => tag.length)
+						: [];
+					const modified = clientSearcheeModified(
+						this.label,
+						dbTorrent,
+						name,
+						savePath,
+						{
+							category,
+							tags,
+						},
+					);
+					const refresh =
+						options?.refresh === undefined
+							? false
+							: options.refresh.length === 0
+								? true
+								: options.refresh.includes(infoHash);
+
+					return !modified && !refresh;
+				},
+				!options?.newSearcheesOnly && options?.refresh?.length !== 0,
+				lease.sourceLocator,
+			)) {
+				aliases.set(
+					infoHash,
+					[torrent.hash, torrent.infohash_v1, torrent.infohash_v2]
+						.filter((alias): alias is string => Boolean(alias))
+						.map((alias) => alias.toLowerCase()),
+				);
+				infoHashes.add(infoHash);
+				if (useCache) {
+					if (!options?.newSearcheesOnly) {
+						searchees.push(createSearcheeFromDB(dbTorrent!));
+					}
+					continue;
+				}
+
+				const { name } = torrent;
+				const savePath = torrent.save_path;
+				const category = torrent.category;
+				const tags = torrent.tags.length
+					? torrent.tags
+							.split(",")
+							.map((tag) => tag.trim())
+							.filter((tag) => tag.length)
+					: [];
+				const files =
+					torrent.files?.map((f) => this.torrentFileToFile(f)) ??
+					(await this.getFiles(torrent.hash));
+				if (!files) {
+					logger.verbose({
+						label: this.label,
+						message: `Failed to get files for ${torrent.name} [${sanitizeInfoHash(torrent.hash)}] (likely transient)`,
+					});
+					metadataComplete = false;
+					continue;
+				}
+				if (!files.length) {
+					logger.verbose({
+						label: this.label,
+						message: `No files found for ${torrent.name} [${sanitizeInfoHash(torrent.hash)}]: skipping`,
+					});
+					// A magnet awaiting metadata is present in the authoritative
+					// catalog but has no file inventory yet. Keep its known source
+					// and aliases without publishing empty replacement metadata.
+					if (torrent.state !== "metaDL" || !(torrent.total_size < 0))
+						metadataComplete = false;
+					continue;
+				}
+				const trackers = torrent.trackers
+					? organizeTrackers(torrent.trackers)
+					: await this.getTrackers(torrent.hash);
+				if (!trackers) {
+					logger.verbose({
+						label: this.label,
+						message: `Failed to get trackers for ${torrent.name} [${sanitizeInfoHash(torrent.hash)}] (likely transient)`,
+					});
+					metadataComplete = false;
+					continue;
+				}
+				const title = parseTitle(name, files) ?? name;
+				const length = torrent.total_size;
+				const searchee: SearcheeClient = {
+					infoHash,
+					name,
+					title,
+					files,
+					length,
+					clientHost: this.clientHost,
+					savePath,
 					category,
 					tags,
-				},
-			);
-			const refresh =
-				options?.refresh === undefined
-					? false
-					: options.refresh.length === 0
-						? true
-						: options.refresh.includes(infoHash);
-			if (!modified && !refresh) {
-				if (!options?.newSearcheesOnly) {
-					searchees.push(createSearcheeFromDB(dbTorrent!));
+					trackers,
+				};
+				if (!torrent.files || !torrent.trackers)
+					detailSnapshots.push(torrent);
+				newSearchees.push(searchee);
+				searchees.push(searchee);
+			}
+			for (
+				let offset = 0;
+				offset < detailSnapshots.length;
+				offset += 100
+			) {
+				const batch = detailSnapshots.slice(offset, offset + 100);
+				const fresh = await this.metadataRequest<TorrentInfo[]>(
+					"/torrents/info",
+					new URLSearchParams({
+						hashes: batch.map((torrent) => torrent.hash).join("|"),
+					}),
+				);
+				for (const torrent of batch) {
+					const current = fresh.find(
+						(value) =>
+							value.hash.toLowerCase() ===
+							torrent.hash.toLowerCase(),
+					);
+					if (
+						!current ||
+						torrentFingerprint(current) !==
+							torrentFingerprint(torrent)
+					)
+						throw new ClientCacheConcurrencyError();
 				}
-				continue;
 			}
-			const files =
-				torrent.files?.map((f) => this.torrentFileToFile(f)) ??
-				(await this.getFiles(torrent.hash));
-			if (!files) {
-				logger.verbose({
-					label: this.label,
-					message: `Failed to get files for ${torrent.name} [${sanitizeInfoHash(torrent.hash)}] (likely transient)`,
-				});
-				continue;
-			}
-			if (!files.length) {
-				logger.verbose({
-					label: this.label,
-					message: `No files found for ${torrent.name} [${sanitizeInfoHash(torrent.hash)}]: skipping`,
-				});
-				continue;
-			}
-			const trackers = torrent.trackers
-				? organizeTrackers(torrent.trackers)
-				: await this.getTrackers(torrent.hash);
-			if (!trackers) {
-				logger.verbose({
-					label: this.label,
-					message: `Failed to get trackers for ${torrent.name} [${sanitizeInfoHash(torrent.hash)}] (likely transient)`,
-				});
-				continue;
-			}
-			const title = parseTitle(name, files) ?? name;
-			const length = torrent.total_size;
-			const searchee: SearcheeClient = {
-				infoHash,
-				name,
-				title,
-				files,
-				length,
-				clientHost: this.clientHost,
-				savePath,
-				category,
-				tags,
-				trackers,
-			};
-			newSearchees.push(searchee);
-			searchees.push(searchee);
+			const accepted = await updateSearcheeClientDB(
+				this.clientHost,
+				newSearchees,
+				infoHashes,
+				lease,
+				metadataComplete,
+				aliases,
+			);
+			if (!accepted) throw new ClientCacheConcurrencyError();
+			if (!metadataComplete)
+				throw new CrossSeedError(
+					"Client catalog metadata hydration incomplete",
+				);
+			return { searchees, newSearchees };
+		} finally {
+			releaseClientCacheOperation(lease);
 		}
-		await updateSearcheeClientDB(this.clientHost, newSearchees, infoHashes);
-		return { searchees, newSearchees };
 	}
 
 	/**

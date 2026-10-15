@@ -1,5 +1,9 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useSuspenseQuery } from "@tanstack/react-query";
+import {
+  useSuspenseQuery,
+  useMutation,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -42,10 +46,21 @@ const severityIcon = {
 function HealthPage() {
   const trpc = useTRPC();
   const {
-    data: { problems, diagnostics },
-    refetch,
+    data: { problems, diagnostics, measuredAt },
     isFetching,
+    error: snapshotError,
   } = useSuspenseQuery(trpc.health.get.queryOptions());
+
+  const queryClient = useQueryClient();
+  const refresh = useMutation(
+    trpc.health.refresh.mutationOptions({
+      onSuccess: (value) =>
+        queryClient.setQueryData(trpc.health.get.queryKey(), value),
+    }),
+  );
+  const refreshing = isFetching || refresh.isPending;
+
+  const stale = Date.now() - measuredAt >= 60_000;
 
   const sortedProblems = [...problems].sort(
     (a, b) => severityOrder[a.severity] - severityOrder[b.severity],
@@ -68,14 +83,14 @@ function HealthPage() {
           variant="outline"
           size="sm"
           onClick={() => {
-            void refetch();
+            refresh.mutate();
           }}
-          disabled={isFetching}
+          disabled={refreshing}
         >
           <RefreshCw
             className={cn(
               "mr-2 h-4 w-4",
-              isFetching && "text-primary animate-spin",
+              refreshing && "text-primary animate-spin",
             )}
           />
           Refresh
@@ -89,15 +104,37 @@ function HealthPage() {
             A quick snapshot of anything that needs attention. Issues are
             ordered by severity.
           </p>
+          <p className="text-muted-foreground text-xs">
+            Measured {new Date(measuredAt).toLocaleString()}. Automatic
+            snapshots are cached for up to one minute.
+          </p>
+          {snapshotError && (
+            <p className="text-destructive text-sm">
+              Latest health snapshot failed: {snapshotError.message}
+            </p>
+          )}
+          {stale && (
+            <p className="text-sm text-amber-700">
+              This snapshot is over one minute old. Refresh to check current
+              status.
+            </p>
+          )}
+          {refresh.error && (
+            <p className="text-destructive text-sm">
+              Refresh failed: {refresh.error.message}
+            </p>
+          )}
         </div>
 
         {sortedProblems.length === 0 ? (
           <div className="flex items-center gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-4 text-sm text-emerald-700">
             <CheckCircle2 className="h-5 w-5" />
             <div>
-              <p className="font-medium">All clear</p>
+              <p className="font-medium">
+                {stale ? "Last snapshot was clear" : "All clear"}
+              </p>
               <p className="text-muted-foreground">
-                No health issues detected. Everything looks good.
+                No health issues were detected in this snapshot.
               </p>
             </div>
           </div>
