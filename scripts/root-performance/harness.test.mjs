@@ -331,13 +331,19 @@ test("candidate worker is enabled only for B and inherited settings cannot affec
 	assert.throws(() => workerEnvironment({}, "other", true), /Invalid/);
 });
 
-
 test("the repaired bridge compares compatibility metadata while retaining strict data and membership gates", async () => {
- const {readFile} = await import("node:fs/promises");
- const {adaptWorker} = await import("./adapt-worker.mjs");
- const original = await readFile(new URL("../benchmarks/combined-cleanup.mjs", import.meta.url),"utf8");
- const generated = adaptWorker(original);
- assert.ok(generated.includes("key !== 'source_namespace_id'"));
- const runner = await readFile(new URL("./run-aba.mjs",import.meta.url),"utf8");
- assert.ok(runner.includes("result.dataRowsMatch")); assert.ok(runner.includes("result.cacheRowsMatch"));
+	const { readFile } = await import("node:fs/promises");
+	const { adaptWorker } = await import("./adapt-worker.mjs");
+	const original = await readFile(
+		new URL("../benchmarks/combined-cleanup.mjs", import.meta.url),
+		"utf8",
+	);
+	const generated = adaptWorker(original);
+	assert.ok(generated.includes("key !== 'source_namespace_id'"));
+	const runner = await readFile(
+		new URL("./run-aba.mjs", import.meta.url),
+		"utf8",
+	);
+	assert.ok(runner.includes("result.dataRowsMatch"));
+	assert.ok(runner.includes("result.cacheRowsMatch"));
 });
