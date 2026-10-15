@@ -1211,7 +1211,11 @@ export default class QBittorrent implements TorrentClient {
 						label: this.label,
 						message: `No files found for ${torrent.name} [${sanitizeInfoHash(torrent.hash)}]: skipping`,
 					});
-					metadataComplete = false;
+					// A magnet awaiting metadata is present in the authoritative
+					// catalog but has no file inventory yet. Keep its known source
+					// and aliases without publishing empty replacement metadata.
+					if (torrent.state !== "metaDL" || !(torrent.total_size < 0))
+						metadataComplete = false;
 					continue;
 				}
 				const trackers = torrent.trackers

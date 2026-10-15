@@ -186,6 +186,7 @@ beforeEach(async () => {
 	failCatalog = false;
 	catalogDelay = 0;
 	info.state = "downloading";
+	info.total_size = 100;
 	const { ensureSourceNamespace } = await import("../src/sourceStore.js");
 	const address = server.address() as import("node:net").AddressInfo;
 	const owner = await ensureSourceNamespace(
@@ -630,6 +631,116 @@ describe("qB request ordered publication", () => {
 		);
 		expect(scopes).toBe(3);
 	});
+
+	it.each(["metaDL"])(
+		"skips new pending metadata %s while reconciling actual absence",
+		async (state) => {
+			info.state = state;
+			info.total_size = -1;
+			await db("client_searchee").where("client_host", "fixture").del();
+			await db("client_searchee").insert({
+				client_host: "fixture",
+				source_namespace_id: fixtureOwner,
+				info_hash: "absent",
+				name: "absent",
+				files: "[]",
+			});
+			const files = vi.spyOn(client, "getFiles").mockResolvedValue([]);
+			try {
+				expect(
+					await client.getClientSearchees({ refresh: [] }),
+				).toEqual({ searchees: [], newSearchees: [] });
+				expect(
+					await db("client_searchee").where("client_host", "fixture"),
+				).toHaveLength(0);
+			} finally {
+				files.mockRestore();
+			}
+		},
+	);
+	it("preserves present pending metadata cache, source membership and aliases", async () => {
+		await client.getClientSearchees({ refresh: [] });
+		const cached = await db<ClientSearcheeRow>("client_searchee")
+			.where({ client_host: "fixture", info_hash: hash })
+			.first();
+		const aliasesBefore = await db<{
+			namespace_id: string;
+			alias: string;
+			origin_id: string;
+		}>("source_alias")
+			.where("namespace_id", fixtureOwner)
+			.orderBy("alias");
+		await db("physical_path")
+			.insert({ path: "/synthetic/pending.mkv" })
+			.onConflict("path")
+			.ignore();
+		const path = await db<{ id: number; path: string }>("physical_path")
+			.where("path", "/synthetic/pending.mkv")
+			.first();
+		await db("ensemble_membership")
+			.insert({
+				origin_id: aliasesBefore[0].origin_id,
+				path_id: path!.id,
+				ensemble: "Pending",
+				element: "1",
+				selection_order: 1,
+			})
+			.onConflict(["origin_id", "path_id", "ensemble", "element"])
+			.ignore();
+		const membershipsBefore = await db("ensemble_membership").whereIn(
+			"origin_id",
+			aliasesBefore.map((row) => row.origin_id),
+		);
+		info.state = "metaDL";
+		info.total_size = -1;
+		const files = vi.spyOn(client, "getFiles").mockResolvedValue([]);
+		try {
+			expect(await client.getClientSearchees({ refresh: [] })).toEqual({
+				searchees: [],
+				newSearchees: [],
+			});
+			expect(
+				await db("client_searchee")
+					.where({ client_host: "fixture", info_hash: hash })
+					.first(),
+			).toEqual(cached);
+			expect(
+				await db("source_alias")
+					.where("namespace_id", fixtureOwner)
+					.orderBy("alias"),
+			).toEqual(aliasesBefore);
+			expect(
+				await db("ensemble_membership").whereIn(
+					"origin_id",
+					aliasesBefore.map((row) => row.origin_id),
+				),
+			).toEqual(membershipsBefore);
+		} finally {
+			files.mockRestore();
+		}
+	});
+	it.each([
+		{ state: "downloading", size: -1, files: [] },
+		{ state: "metaDL", size: 100, files: [] },
+		{ state: "metaDL", size: 0, files: [] },
+		{ state: "metaDL", size: -1, files: null },
+	])(
+		"retains incomplete errors outside recognized pending metadata: %j",
+		async (value) => {
+			info.state = value.state;
+			info.total_size = value.size;
+			const files = vi
+				.spyOn(client, "getFiles")
+				.mockResolvedValue(value.files);
+			try {
+				await expect(
+					client.getClientSearchees({ refresh: [] }),
+				).rejects.toThrow("incomplete");
+			} finally {
+				files.mockRestore();
+			}
+		},
+	);
 
 	it("preserves absent cached sources when complete detail hydration fails", async () => {
 		await db("client_searchee").insert({
